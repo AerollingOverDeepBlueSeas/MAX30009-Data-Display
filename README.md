@@ -1,0 +1,144 @@
+# MAX30009 BioZ viewer
+
+`plots.py` reads either CSV from a MAX30009 recording. It finds
+the companion CSV in the same directory using the shared recording time token
+(`HHMMSS`). It supports both the long date form, such as
+`20260909_114235`, and the shorter form used by the supplied calibrated file,
+`0909_114235`.
+
+## Install
+
+The program uses Python 3, NumPy, and Matplotlib:
+
+```text
+python -m pip install numpy matplotlib
+```
+
+## Run
+
+Pass only one of the two long CSV names:
+
+```text
+python plots.py MAX30009_20260909_114235.bioz.csv
+```
+
+You may also pass the directory containing the pair:
+
+```text
+python plots.py .
+```
+
+## Recording manager
+
+`watch_max30009.py` manages the recordings in the folder containing the plotting
+and provides a selectable catalogue of complete CSV pairs:
+
+```text
+python watch_max30009.py
+```
+
+The manager extracts the `YYYYMMDD_HHMMSS` (or `MMDD_HHMMSS`) identifier from
+each `.bioz.csv` filename, matches its calibrated CSV using the normalized
+`MMDD_HHMMSS` token, and waits until both files stop changing before listing
+the pair. Existing pairs are scanned when the manager starts, so no
+`--process-existing` flag is needed. Select a row to reveal `Display Plot` and
+`Annotate`. Use `Display Plot` to launch `plots.py` with both CSV paths; use
+`Annotate` to reveal the editable annotation box and then save it. The
+catalogue refreshes automatically, so newly exported pairs appear while the
+manager remains open.
+
+Annotations are stored in `max30009_recording_annotations.json` beside the
+script. This is a small sidecar file, not a measurement input, and it keeps
+annotations available across sessions. If Tkinter is unavailable, use (or the
+program will fall back to) a text menu:
+
+```text
+python watch_max30009.py --console
+```
+
+If the annotation file is malformed, the GUI shows a warning and asks whether
+to exit and repair it or proceed without the old annotations. Saving an
+annotation after proceeding replaces the malformed file with a valid one.
+
+Useful options include `--stable-seconds 5` if the export takes longer to
+finish, `--poll-interval 1` for more frequent checks, `--directory` when the
+exported files are stored somewhere other than the script directory, and
+`--annotations path/to/annotations.json` for a different sidecar location.
+
+The default initial smooth-period threshold is ±100 Ω. The interactive window
+contains a working `Smooth ±Ω` slider that moves in 10 Ω steps; changing it
+redraws the red horizontal stable-period markers immediately. The `Value (Ω)`
+box beside the slider accepts a direct threshold and moves the slider to match
+it. The slider and input are retained by the figure so they continue
+responding after the window has opened.
+
+By default, both plots show the complete recording. To inspect a moving time
+window, select `Custom Time Window`, enter a positive length in seconds, and
+press Enter or leave the input field. The horizontal `Window start (s)` slider
+then moves continuously through the complete recording. For example, a length
+of 5 seconds can show 1.0–6.0 s, 1.2–6.2 s, and so on. Unselecting the checkbox
+returns to the full-recording view.
+
+The magnitude graph also has independent checkboxes for `Limit Upper
+(Impedance Magnitude)` and `Limit Lower (Impedance Magnitude)`. When selected,
+each displays an ohm input. Values outside the selected limits are cropped
+from the magnitude view. With both unchecked, the y-axis returns to the global
+minimum and maximum of the measured data.
+
+The phase graph uses a fixed −180° to 180° vertical range, with ticks at
+−180°, −90°, 0°, 90°, and 180°.
+
+Clicking either plot displays the nearest sample's time, magnitude, phase, and
+calibrated I/Q values.
+
+Useful options:
+
+```text
+python plots.py recording.csv \
+    --smooth-threshold 100 \
+    --stability-window 1.0 \
+    --min-stable-duration 0.5 \
+    --mag-ylim 0 600 \
+    --save-plot
+```
+
+`--mag-ylim LOWER UPPER` remains available for starting the display with both
+magnitude limit controls enabled. The on-screen controls can then be adjusted
+without rerunning the program.
+
+The program writes three files to `--output-dir`:
+
+- `*_calculated.csv`: timestamp, time in seconds, calibrated I/Q, real and
+  imaginary impedance, magnitude, and phase;
+- `*_stable_periods.csv`: detected intervals and their statistics;
+- `*_decoded_settings.json`: register values, decoded timing/current/gain,
+  scale factor, and validation results.
+
+## Calculation notes
+
+The calibrated columns in the supplied second CSV are already the corrected
+real and imaginary components in count units. The program therefore multiplies
+them by the ohms/count scale; it does not apply the calibration coefficients a
+second time. It also independently applies the MAX30009 calibration equations
+to the raw columns and checks that the exported calibrated columns agree after
+rounding.
+
+The ohms/count scale is decoded for current-drive mode from registers 0x17,
+0x18, 0x1A, 0x20, 0x22, and 0x24. The current-drive equation is the MAX30009
+datasheet equation using the typical 1 V VREF. The current implementation
+requires `--external-ref-hz` for an external PLL reference and `--rext-ohm`
+for an external current-setting resistor. Voltage-drive and H-bridge absolute
+impedance conversion are intentionally not implemented yet because they need
+their respective divider/series-resistor parameters.
+
+The default time axis is based on the logged epoch-millisecond timestamps, with
+the first aligned sample set to 0 s. Use `--time-source sample-rate` if you
+instead want time derived from the decoded BioZ sample rate.
+
+The stability detector currently defines a stable window as one whose rolling
+range is no greater than `2 × threshold`; thus ±100 Ω corresponds to a maximum
+rolling range of 200 Ω. The detection window, minimum interval duration, merge
+gap, and threshold are adjustable.
+
+Datasheet:
+<https://www.analog.com/media/en/technical-documentation/data-sheets/MAX30009.pdf>
