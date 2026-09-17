@@ -38,14 +38,18 @@ python watch_max30009.py
 ```
 
 The manager extracts the `YYYYMMDD_HHMMSS` (or `MMDD_HHMMSS`) identifier from
-each `.bioz.csv` filename, matches its calibrated CSV using the normalized
-`MMDD_HHMMSS` token, and waits until both files stop changing before listing
-the pair. Existing pairs are scanned when the manager starts, so no
+each `.bioz.csv` filename and matches its calibrated CSV using the normalized
+`MMDD_HHMMSS` token. Existing complete pairs are scanned when the manager
+starts, so no
 `--process-existing` flag is needed. Select a row to reveal `Display Plot` and
 `Annotate`. Use `Display Plot` to launch `plots.py` with both CSV paths; use
 `Annotate` to reveal the editable annotation box and then save it. The
-catalogue refreshes automatically, so newly exported pairs appear while the
-manager remains open.
+catalogue is refreshed only when `Refresh Now` is clicked, so editing an
+annotation cannot be interrupted by a background scan. Newly exported pairs
+appear after the next manual refresh.
+
+The annotation editor includes `Copy` and `Paste` buttons, standard keyboard
+shortcuts such as Ctrl+C/Ctrl+V, and a right-click menu.
 
 Annotations are stored in `max30009_recording_annotations.json` beside the
 script. This is a small sidecar file, not a measurement input, and it keeps
@@ -60,8 +64,9 @@ If the annotation file is malformed, the GUI shows a warning and asks whether
 to exit and repair it or proceed without the old annotations. Saving an
 annotation after proceeding replaces the malformed file with a valid one.
 
-Useful options include `--stable-seconds 5` if the export takes longer to
-finish, `--poll-interval 1` for more frequent checks, `--directory` when the
+If a manual refresh might occur while an export is still being written,
+`--stable-seconds 3` enables a safety delay; click `Refresh Now` again after
+that delay to list the pair. Other useful options are `--directory` when the
 exported files are stored somewhere other than the script directory, and
 `--annotations path/to/annotations.json` for a different sidecar location.
 

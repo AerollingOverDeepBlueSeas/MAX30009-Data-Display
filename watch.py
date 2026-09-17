@@ -3,16 +3,19 @@
 
 The manager scans the directory containing this script by default.  It finds
 the calibrated ``.csv`` file that belongs to each ``.bioz.csv`` export,
-waits until both files have stopped changing, and lists complete recordings
-in a small desktop window.  Selecting a recording launches the existing
-``plots.py`` program with both CSV files from that recording.
+optionally waits until both files have stopped changing, and lists complete
+recordings in a small desktop window.  The directory is scanned at startup and again
+only when the user clicks ``Refresh Now``.  Selecting a recording launches the
+existing ``plots.py`` program with both CSV files from that recording.
 
 Annotations are stored in ``max30009_recording_annotations.json`` beside the
 script, so they remain available the next time the manager is opened.  The
 program uses only Python's standard library; Tkinter is used for the desktop
 window when it is available.
 
-Run from the directory containing this file and the viewer:
+Run from the directory containing this file and the plotting program.  The
+directory is scanned once at startup; click ``Refresh Now`` when you want to
+look for newly exported files:
 
     python watch_max30009.py
 
@@ -344,7 +347,10 @@ def launch_viewer(
 def build_argument_parser() -> argparse.ArgumentParser:
     script_directory = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Catalogue MAX30009 CSV pairs and open the plotting program."
+        description=(
+            "Catalogue MAX30009 CSV pairs and open the plotting program; "
+            "refreshes are manual."
+        )
     )
     parser.add_argument(
         "--directory",
@@ -374,16 +380,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=2.0,
-        help="seconds between automatic catalogue refreshes",
-    )
-    parser.add_argument(
         "--stable-seconds",
         type=float,
-        default=3.0,
-        help="seconds both CSVs must remain unchanged before they are listed",
+        default=0.0,
+        help=(
+            "optional safety delay requiring both CSVs to remain unchanged "
+            "before they are listed"
+        ),
     )
     parser.add_argument(
         "--console",
@@ -413,7 +416,6 @@ class RecordingManagerGUI:
         output_directory: Path,
         annotations_path: Path,
         annotations: dict[str, str],
-        poll_interval: float,
         stable_seconds: float,
     ) -> None:
         self.root = root
@@ -424,7 +426,6 @@ class RecordingManagerGUI:
         self.viewer = viewer
         self.output_directory = output_directory
         self.annotations_path = annotations_path
-        self.poll_interval = poll_interval
         self.stable_seconds = stable_seconds
 
         self.annotations = dict(annotations)
@@ -433,7 +434,6 @@ class RecordingManagerGUI:
         self.pairs_by_key: dict[str, RecordingPair] = {}
         self.item_to_key: dict[str, str] = {}
         self.selected_key: Optional[str] = None
-        self.refresh_after_id: Optional[str] = None
         self.annotation_editor_visible = False
 
         self.root.title("MAX30009 Recording Manager")
@@ -533,9 +533,12 @@ class RecordingManagerGUI:
 
         self.annotation_editor = self.ttk.Frame(self.action_frame)
         self.annotation_editor.columnconfigure(1, weight=1)
+        self.annotation_editor.rowconfigure(0, weight=1)
+        self.annotation_editor.rowconfigure(1, weight=1)
         self.ttk.Label(self.annotation_editor, text="Description:").grid(
             row=0,
             column=0,
+            rowspan=2,
             sticky="nw",
             padx=(0, 8),
         )
@@ -545,17 +548,46 @@ class RecordingManagerGUI:
             width=60,
             wrap="word",
         )
-        self.annotation_text.grid(row=0, column=1, sticky="ew")
+        self.annotation_text.grid(row=0, column=1, rowspan=2, sticky="nsew")
+        self.ttk.Button(
+            self.annotation_editor,
+            text="Copy",
+            command=self._copy_annotation,
+        ).grid(row=0, column=2, sticky="n", padx=(8, 0))
+        self.ttk.Button(
+            self.annotation_editor,
+            text="Paste",
+            command=self._paste_annotation,
+        ).grid(row=1, column=2, sticky="n", padx=(8, 0))
         self.ttk.Button(
             self.annotation_editor,
             text="Save Annotation",
             command=self._save_selected_annotation,
-        ).grid(row=0, column=2, sticky="n", padx=(8, 0))
+        ).grid(row=0, column=3, sticky="n", padx=(8, 0))
         self.ttk.Button(
             self.annotation_editor,
             text="Cancel",
             command=self._cancel_annotation,
-        ).grid(row=0, column=3, sticky="n", padx=(8, 0))
+        ).grid(row=1, column=3, sticky="n", padx=(8, 0))
+
+        self.annotation_menu = self.tk.Menu(self.annotation_text, tearoff=False)
+        self.annotation_menu.add_command(label="Cut", command=self._cut_annotation)
+        self.annotation_menu.add_command(label="Copy", command=self._copy_annotation)
+        self.annotation_menu.add_command(label="Paste", command=self._paste_annotation)
+        self.annotation_menu.add_separator()
+        self.annotation_menu.add_command(
+            label="Select All",
+            command=self._select_all_annotation,
+        )
+        self.annotation_text.bind("<Button-3>", self._show_annotation_context_menu)
+        self.annotation_text.bind("<Control-c>", self._copy_annotation)
+        self.annotation_text.bind("<Control-v>", self._paste_annotation)
+        self.annotation_text.bind("<Control-x>", self._cut_annotation)
+        self.annotation_text.bind("<Control-a>", self._select_all_annotation)
+        self.annotation_text.bind("<Command-c>", self._copy_annotation)
+        self.annotation_text.bind("<Command-v>", self._paste_annotation)
+        self.annotation_text.bind("<Command-x>", self._cut_annotation)
+        self.annotation_text.bind("<Command-a>", self._select_all_annotation)
 
         # Keep the selected-recording controls hidden until a row is selected.
         self.action_frame.grid_remove()
@@ -590,6 +622,48 @@ class RecordingManagerGUI:
     def _set_annotation_editor_text(self, annotation: str) -> None:
         self.annotation_text.delete("1.0", "end")
         self.annotation_text.insert("1.0", annotation)
+
+    def _copy_annotation(self, _event: Any = None) -> str:
+        try:
+            selected = self.annotation_text.get("sel.first", "sel.last")
+        except self.tk.TclError:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(selected)
+        return "break"
+
+    def _cut_annotation(self, _event: Any = None) -> str:
+        if self._copy_annotation() == "break":
+            try:
+                self.annotation_text.delete("sel.first", "sel.last")
+            except self.tk.TclError:
+                pass
+        return "break"
+
+    def _paste_annotation(self, _event: Any = None) -> str:
+        try:
+            pasted = self.root.clipboard_get()
+        except self.tk.TclError:
+            return "break"
+        try:
+            self.annotation_text.delete("sel.first", "sel.last")
+        except self.tk.TclError:
+            pass
+        self.annotation_text.insert("insert", pasted)
+        return "break"
+
+    def _select_all_annotation(self, _event: Any = None) -> str:
+        self.annotation_text.focus_set()
+        self.annotation_text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _show_annotation_context_menu(self, event: Any) -> str:
+        self.annotation_text.focus_set()
+        try:
+            self.annotation_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.annotation_menu.grab_release()
+        return "break"
 
     def _on_selection_changed(self, _event: Any = None) -> None:
         selection = self.tree.selection()
@@ -692,6 +766,12 @@ class RecordingManagerGUI:
 
     def refresh(self) -> None:
         previous_key = self.selected_key
+        editor_was_visible = self.annotation_editor_visible
+        editor_draft = (
+            self.annotation_text.get("1.0", "end-1c")
+            if editor_was_visible
+            else ""
+        )
         try:
             pairs, pending = discover_recording_pairs(
                 self.directory,
@@ -700,7 +780,6 @@ class RecordingManagerGUI:
             )
         except OSError as exc:
             self.status_var.set(f"Could not scan folder: {exc}")
-            self._schedule_refresh()
             return
 
         pairs.sort(
@@ -729,6 +808,9 @@ class RecordingManagerGUI:
             self.tree.selection_set(selected_item)
             self.tree.focus(selected_item)
             self._on_selection_changed()
+            if editor_was_visible:
+                self._show_annotation_editor()
+                self._set_annotation_editor_text(editor_draft)
         elif not pairs:
             self.selected_key = None
             self._hide_selected_controls()
@@ -745,23 +827,8 @@ class RecordingManagerGUI:
         if pending:
             status += f" | {len(pending)} pending/incomplete"
         self.status_var.set(status)
-        self._schedule_refresh()
-
-    def _schedule_refresh(self) -> None:
-        if self.refresh_after_id is not None:
-            try:
-                self.root.after_cancel(self.refresh_after_id)
-            except self.tk.TclError:
-                pass
-        delay_ms = max(100, int(self.poll_interval * 1000))
-        self.refresh_after_id = self.root.after(delay_ms, self.refresh)
 
     def _on_close(self) -> None:
-        if self.refresh_after_id is not None:
-            try:
-                self.root.after_cancel(self.refresh_after_id)
-            except self.tk.TclError:
-                pass
         self.root.destroy()
 
 
@@ -771,7 +838,6 @@ def run_console(
     viewer: Path,
     output_directory: Path,
     annotations_path: Path,
-    poll_interval: float,
     stable_seconds: float,
 ) -> int:
     """Run a small text-menu fallback when a desktop display is unavailable."""
@@ -829,10 +895,6 @@ def run_console(
         if command.lower() in {"q", "quit", "exit"}:
             return 0
         if command.lower() in {"r", "refresh", ""}:
-            if poll_interval > 0:
-                # A short pause prevents an accidental refresh from spinning
-                # the console while still keeping the menu responsive.
-                time.sleep(min(poll_interval, 0.5))
             continue
 
         parts = command.split(maxsplit=1)
@@ -883,7 +945,6 @@ def run_gui(
     viewer: Path,
     output_directory: Path,
     annotations_path: Path,
-    poll_interval: float,
     stable_seconds: float,
 ) -> int:
     """Start the Tkinter manager, or fall back to the text menu."""
@@ -898,7 +959,6 @@ def run_gui(
             viewer=viewer,
             output_directory=output_directory,
             annotations_path=annotations_path,
-            poll_interval=poll_interval,
             stable_seconds=stable_seconds,
         )
 
@@ -911,7 +971,6 @@ def run_gui(
             viewer=viewer,
             output_directory=output_directory,
             annotations_path=annotations_path,
-            poll_interval=poll_interval,
             stable_seconds=stable_seconds,
         )
 
@@ -942,7 +1001,6 @@ def run_gui(
         output_directory=output_directory,
         annotations_path=annotations_path,
         annotations=annotations,
-        poll_interval=poll_interval,
         stable_seconds=stable_seconds,
     )
     root.mainloop()
@@ -970,11 +1028,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not viewer.is_file():
         print(f"ERROR: viewer script does not exist: {viewer}", file=sys.stderr)
         return 2
-    if args.poll_interval <= 0 or args.stable_seconds < 0:
-        print(
-            "ERROR: poll interval must be positive and stable time cannot be negative",
-            file=sys.stderr,
-        )
+    if args.stable_seconds < 0:
+        print("ERROR: stable time cannot be negative", file=sys.stderr)
         return 2
 
     runner = run_console if args.console else run_gui
@@ -983,7 +1038,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         viewer=viewer,
         output_directory=output_directory,
         annotations_path=annotations_path,
-        poll_interval=args.poll_interval,
         stable_seconds=args.stable_seconds,
     )
 
