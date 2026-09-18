@@ -105,11 +105,13 @@ they are converted back to displayed magnitude and phase. The source data,
 click readouts, stability detection, and exported CSV files are not changed,
 and the smoothing selection is discarded when the program closes.
 
-`Copy to Clipboard` copies a PNG containing the two plot areas, their labels,
-and the phase time-axis label, while leaving the controls out of the image.
-On Windows this uses the built-in image clipboard format. On Linux, an image
-clipboard helper such as `wl-copy` or `xclip` is required; if no supported
-clipboard backend is available, the program reports that in the readout area.
+`Copy to Clipboard` copies a full-width PNG screenshot from the top of the
+figure through the phase time-axis label, while leaving the controls below the
+plots out of the image. The capture uses the actual rendered pixel buffer, so
+it also works correctly on high-DPI Windows displays. On Windows this uses the
+built-in image clipboard format. On Linux, an image clipboard helper such as
+`wl-copy` or `xclip` is required; if no supported clipboard backend is
+available, the program reports that in the readout area.
 
 Useful options:
 

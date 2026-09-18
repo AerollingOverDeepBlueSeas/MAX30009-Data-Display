@@ -1109,8 +1109,8 @@ def smooth_impedance_for_display(
     return np.hypot(real, imag), np.degrees(np.arctan2(imag, real))
 
 
-def _plot_crop_bbox(fig: Any, axes: Iterable[Any], pad_px: float = 4.0) -> Bbox:
-    """Return the figure-space bounding box for the plot and its labels."""
+def _plot_crop_bbox(fig: Any, axes: Iterable[Any]) -> Bbox:
+    """Return a full-width box from the figure top to the plot labels."""
 
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
@@ -1122,12 +1122,12 @@ def _plot_crop_bbox(fig: Any, axes: Iterable[Any], pad_px: float = 4.0) -> Bbox:
     combined = Bbox.union(boxes)
     figure_box = fig.bbox
     return Bbox.from_extents(
-        max(float(figure_box.x0), float(combined.x0) - pad_px),
+        float(figure_box.x0),
         # Do not pad below the phase x-axis label: the stable-period status
-        # text lives immediately underneath the plot controls area.
+        # text lives immediately underneath the plot axes.
         max(float(figure_box.y0), float(combined.y0)),
-        min(float(figure_box.x1), float(combined.x1) + pad_px),
-        min(float(figure_box.y1), float(combined.y1) + pad_px),
+        float(figure_box.x1),
+        float(figure_box.y1),
     )
 
 
@@ -1142,17 +1142,26 @@ def render_plot_for_clipboard(
     """
 
     crop = _plot_crop_bbox(fig, axes)
-    width, height = fig.canvas.get_width_height()
     full_rgba = np.asarray(fig.canvas.buffer_rgba())
     if full_rgba.ndim != 3 or full_rgba.shape[2] != 4:
         raise ClipboardError("the Matplotlib canvas did not provide RGBA pixels")
+    height, width, _ = full_rgba.shape
 
-    x0 = max(0, int(math.floor(float(crop.x0 - fig.bbox.x0))))
-    x1 = min(width, int(math.ceil(float(crop.x1 - fig.bbox.x0))))
+    # Bboxes and canvas buffers can use different pixel densities on a
+    # high-DPI display.  Map figure coordinates onto the actual buffer rather
+    # than assuming that get_width_height() reports the buffer dimensions.
+    figure_width = float(fig.bbox.width)
+    figure_height = float(fig.bbox.height)
+    if figure_width <= 0 or figure_height <= 0:
+        raise ClipboardError("the Matplotlib figure has no visible size")
+    x_scale = width / figure_width
+    y_scale = height / figure_height
+    x0 = max(0, int(math.floor((float(crop.x0) - float(fig.bbox.x0)) * x_scale)))
+    x1 = min(width, int(math.ceil((float(crop.x1) - float(fig.bbox.x0)) * x_scale)))
     # Rounding the lower edge upward keeps text below the axes out of the
     # crop while retaining the phase x-axis label itself.
-    y0 = max(0, int(math.ceil(float(crop.y0 - fig.bbox.y0))))
-    y1 = min(height, int(math.ceil(float(crop.y1 - fig.bbox.y0))))
+    y0 = max(0, int(math.ceil((float(crop.y0) - float(fig.bbox.y0)) * y_scale)))
+    y1 = min(height, int(math.ceil((float(crop.y1) - float(fig.bbox.y0)) * y_scale)))
     if x1 <= x0 or y1 <= y0:
         raise ClipboardError("the plot crop has no visible area")
 
