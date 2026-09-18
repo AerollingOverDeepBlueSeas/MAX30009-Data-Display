@@ -93,8 +93,23 @@ minimum and maximum of the measured data.
 The phase graph uses a fixed −180° to 180° vertical range, with ticks at
 −180°, −90°, 0°, 90°, and 180°.
 
-Clicking either plot displays the nearest sample's time, magnitude, phase, and
-calibrated I/Q values.
+The shared time axis uses 4-second major grid spacing. Clicking either plot
+displays the nearest sample's time, magnitude, phase, and calibrated I/Q
+values. If that sample lies within a detected stable period, the readout also
+includes the period's average impedance.
+
+The `Smoothing (s)` slider is a temporary, display-only control. It ranges from
+0 to 0.5 seconds in 0.1-second steps; 0 means no smoothing. A selected window
+applies a centred moving average to the real and imaginary impedance before
+they are converted back to displayed magnitude and phase. The source data,
+click readouts, stability detection, and exported CSV files are not changed,
+and the smoothing selection is discarded when the program closes.
+
+`Copy to Clipboard` copies a PNG containing the two plot areas, their labels,
+and the phase time-axis label, while leaving the controls out of the image.
+On Windows this uses the built-in image clipboard format. On Linux, an image
+clipboard helper such as `wl-copy` or `xclip` is required; if no supported
+clipboard backend is available, the program reports that in the readout area.
 
 Useful options:
 

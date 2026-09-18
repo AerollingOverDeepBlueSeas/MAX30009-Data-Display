@@ -37,17 +37,26 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import re
+import shutil
 import sys
+import struct
+import subprocess
+import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.widgets import CheckButtons, Slider, TextBox
+from matplotlib import image as mpl_image
+from matplotlib.transforms import Bbox
+from matplotlib.ticker import MultipleLocator
+from matplotlib.widgets import Button, CheckButtons, Slider, TextBox
 
 
 DATASHEET_URL = (
@@ -58,6 +67,10 @@ DATASHEET_URL = (
 
 class BioZViewerError(RuntimeError):
     """An expected, user-correctable input or configuration error."""
+
+
+class ClipboardError(RuntimeError):
+    """The plot could not be placed on the system clipboard."""
 
 
 def normalise_text(value: str) -> str:
@@ -919,6 +932,18 @@ def detect_stable_periods(
     return periods
 
 
+def stable_period_containing(
+    periods: Iterable[StablePeriod],
+    time_value: float,
+) -> Optional[StablePeriod]:
+    """Return the stable period containing a time value, if one exists."""
+
+    for period in periods:
+        if period.start_s <= time_value <= period.end_s:
+            return period
+    return None
+
+
 def write_calculated_csv(path: Path, data: CalculatedData) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -1026,6 +1051,273 @@ def set_global_axis_limits(ax: Any, values: np.ndarray, requested: Optional[tupl
     ax.set_ylim(lower, upper)
 
 
+def moving_average_by_time(
+    values: np.ndarray,
+    time_s: np.ndarray,
+    window_s: float,
+) -> np.ndarray:
+    """Return a centred, NaN-aware moving average over a time-sized window.
+
+    The recording is sampled regularly enough for a sample-count window to be
+    an accurate and efficient representation of the requested duration.  The
+    returned array always has the same length as the input array.
+    """
+
+    series = np.asarray(values, dtype=float)
+    if window_s <= 0 or len(series) < 2:
+        return series.copy()
+
+    dt = np.diff(np.asarray(time_s, dtype=float))
+    positive_dt = dt[dt > 0]
+    if len(positive_dt) == 0:
+        return series.copy()
+    samples = max(1, int(round(float(window_s) / float(np.median(positive_dt)))))
+    if samples <= 1:
+        return series.copy()
+    if samples % 2 == 0:
+        samples += 1
+    samples = min(samples, len(series))
+    if samples <= 1:
+        return series.copy()
+
+    finite = np.isfinite(series)
+    filled = np.where(finite, series, 0.0)
+    kernel = np.ones(samples, dtype=float)
+    totals = np.convolve(filled, kernel, mode="same")
+    counts = np.convolve(finite.astype(float), kernel, mode="same")
+    result = np.full(len(series), np.nan, dtype=float)
+    valid = counts > 0
+    result[valid] = totals[valid] / counts[valid]
+    return result
+
+
+def smooth_impedance_for_display(
+    data: CalculatedData,
+    window_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create display-only smoothed magnitude and phase arrays.
+
+    Real and imaginary impedance components are averaged before converting
+    back to polar form.  This avoids incorrect phase averages around the
+    -180°/180° boundary.  ``data`` itself is never modified.
+    """
+
+    if window_s <= 0:
+        return data.magnitude_ohm.copy(), data.phase_deg.copy()
+    real = moving_average_by_time(data.real_ohm, data.time_s, window_s)
+    imag = moving_average_by_time(data.imag_ohm, data.time_s, window_s)
+    return np.hypot(real, imag), np.degrees(np.arctan2(imag, real))
+
+
+def _plot_crop_bbox(fig: Any, axes: Iterable[Any], pad_px: float = 4.0) -> Bbox:
+    """Return the figure-space bounding box for the plot and its labels."""
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = [axis.get_tightbbox(renderer) for axis in axes]
+    boxes = [box for box in boxes if box is not None]
+    if not boxes:
+        raise ClipboardError("the plot area could not be measured")
+
+    combined = Bbox.union(boxes)
+    figure_box = fig.bbox
+    return Bbox.from_extents(
+        max(float(figure_box.x0), float(combined.x0) - pad_px),
+        # Do not pad below the phase x-axis label: the stable-period status
+        # text lives immediately underneath the plot controls area.
+        max(float(figure_box.y0), float(combined.y0)),
+        min(float(figure_box.x1), float(combined.x1) + pad_px),
+        min(float(figure_box.y1), float(combined.y1) + pad_px),
+    )
+
+
+def render_plot_for_clipboard(
+    fig: Any,
+    axes: Iterable[Any],
+) -> tuple[bytes, np.ndarray]:
+    """Render only the requested plot axes, excluding the GUI controls.
+
+    The returned PNG and RGBA pixels are held in memory.  The crop includes
+    the phase x-axis label because it is part of the phase axes' tight box.
+    """
+
+    crop = _plot_crop_bbox(fig, axes)
+    width, height = fig.canvas.get_width_height()
+    full_rgba = np.asarray(fig.canvas.buffer_rgba())
+    if full_rgba.ndim != 3 or full_rgba.shape[2] != 4:
+        raise ClipboardError("the Matplotlib canvas did not provide RGBA pixels")
+
+    x0 = max(0, int(math.floor(float(crop.x0 - fig.bbox.x0))))
+    x1 = min(width, int(math.ceil(float(crop.x1 - fig.bbox.x0))))
+    # Rounding the lower edge upward keeps text below the axes out of the
+    # crop while retaining the phase x-axis label itself.
+    y0 = max(0, int(math.ceil(float(crop.y0 - fig.bbox.y0))))
+    y1 = min(height, int(math.ceil(float(crop.y1 - fig.bbox.y0))))
+    if x1 <= x0 or y1 <= y0:
+        raise ClipboardError("the plot crop has no visible area")
+
+    # Matplotlib display coordinates start at the lower-left, whereas the
+    # canvas pixel buffer starts at the upper-left.
+    cropped_rgba = np.ascontiguousarray(full_rgba[height - y1 : height - y0, x0:x1])
+    png_buffer = io.BytesIO()
+    mpl_image.imsave(png_buffer, cropped_rgba, format="png")
+    return png_buffer.getvalue(), cropped_rgba
+
+
+def _copy_rgba_to_windows_clipboard(rgba: np.ndarray) -> None:
+    """Put RGBA pixels on Windows as a CF_DIB clipboard image."""
+
+    if not sys.platform.startswith("win"):
+        raise ClipboardError("the Windows clipboard backend is unavailable")
+
+    import ctypes
+    from ctypes import wintypes
+
+    pixels = np.asarray(rgba, dtype=np.uint8)
+    if pixels.ndim != 3 or pixels.shape[2] != 4:
+        raise ClipboardError("the plot pixels are not RGBA")
+    height, width, _ = pixels.shape
+    # A Windows DIB is bottom-up BGRA when biHeight is positive.
+    bgra = np.ascontiguousarray(pixels[::-1, :, :][:, :, [2, 1, 0, 3]])
+    bgra[:, :, 3] = 255
+    pixel_bytes = bgra.tobytes()
+    bitmap_info = struct.pack(
+        "<IiiHHIIiiII",
+        40,  # biSize
+        width,
+        height,
+        1,  # biPlanes
+        32,  # biBitCount
+        0,  # BI_RGB
+        len(pixel_bytes),
+        0,
+        0,
+        0,
+        0,
+    )
+    dib = bitmap_info + pixel_bytes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    hglobal_type = wintypes.HGLOBAL
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = hglobal_type
+    kernel32.GlobalLock.argtypes = [hglobal_type]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [hglobal_type]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [hglobal_type]
+    kernel32.GlobalFree.restype = hglobal_type
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+
+    hglobal = kernel32.GlobalAlloc(0x0002, len(dib))  # GMEM_MOVEABLE
+    if not hglobal:
+        raise ClipboardError("Windows could not allocate clipboard memory")
+    clipboard_owns_memory = False
+    clipboard_open = False
+    try:
+        locked = kernel32.GlobalLock(hglobal)
+        if not locked:
+            raise ClipboardError("Windows could not lock clipboard memory")
+        try:
+            ctypes.memmove(locked, dib, len(dib))
+        finally:
+            kernel32.GlobalUnlock(hglobal)
+
+        for _ in range(20):
+            if user32.OpenClipboard(None):
+                clipboard_open = True
+                break
+            time.sleep(0.05)
+        if not clipboard_open:
+            raise ClipboardError("Windows clipboard is busy")
+        if not user32.EmptyClipboard():
+            raise ClipboardError("Windows could not clear the clipboard")
+        if not user32.SetClipboardData(8, hglobal):  # CF_DIB
+            raise ClipboardError("Windows could not set the clipboard image")
+        clipboard_owns_memory = True
+    finally:
+        if clipboard_open:
+            user32.CloseClipboard()
+        if not clipboard_owns_memory:
+            kernel32.GlobalFree(hglobal)
+
+
+def _copy_png_to_unix_clipboard(png_bytes: bytes) -> None:
+    """Use the native image clipboard utility available on Linux/macOS."""
+
+    if sys.platform == "darwin":
+        temporary_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+                handle.write(png_bytes)
+                temporary_path = handle.name
+            escaped_path = temporary_path.replace("\\", "\\\\").replace('"', '\\"')
+            script = (
+                'set the clipboard to (read (POSIX file "'
+                f'{escaped_path}'
+                '") as «class PNGf»)'
+            )
+            subprocess.run(
+                ["osascript", "-e", script],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            return
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise ClipboardError(f"macOS could not set the clipboard image: {exc}") from exc
+        finally:
+            if temporary_path:
+                try:
+                    Path(temporary_path).unlink()
+                except OSError:
+                    pass
+
+    candidates = [
+        (["wl-copy", "--type", "image/png"], "Wayland"),
+        (["xclip", "-selection", "clipboard", "-t", "image/png", "-i"], "X11"),
+    ]
+    attempted = False
+    for command, desktop in candidates:
+        if shutil.which(command[0]) is None:
+            continue
+        attempted = True
+        try:
+            subprocess.run(
+                command,
+                input=png_bytes,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            return
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise ClipboardError(f"{desktop} could not set the clipboard image: {exc}") from exc
+    if not attempted:
+        raise ClipboardError(
+            "no image clipboard helper was found (install wl-copy or xclip)"
+        )
+
+
+def copy_image_to_clipboard(png_bytes: bytes, rgba: np.ndarray) -> None:
+    """Copy a rendered PNG image to the operating system clipboard."""
+
+    if sys.platform.startswith("win"):
+        _copy_rgba_to_windows_clipboard(rgba)
+    else:
+        _copy_png_to_unix_clipboard(png_bytes)
+
+
 def create_interactive_figure(
     data: CalculatedData,
     periods: list[StablePeriod],
@@ -1065,14 +1357,14 @@ def create_interactive_figure(
         label="Impedance phase",
         picker=5,
     )
-    del magnitude_line, phase_line
 
     ax_mag.set_ylabel("Impedance magnitude (Ω)")
     ax_phase.set_ylabel("Phase (°)")
     ax_phase.set_xlabel("Time from first logged sample (s)")
     ax_mag.set_title(f"MAX30009 BioZ: {identifier}")
-    ax_mag.grid(True, alpha=0.3)
-    ax_phase.grid(True, alpha=0.3)
+    for axis in (ax_mag, ax_phase):
+        axis.xaxis.set_major_locator(MultipleLocator(4.0))
+        axis.grid(True, alpha=0.3)
     set_global_axis_limits(ax_mag, data.magnitude_ohm, mag_ylim)
     phase_display_ylim = phase_ylim if phase_ylim is not None else (-180.0, 180.0)
     set_global_axis_limits(ax_phase, data.phase_deg, phase_display_ylim)
@@ -1208,15 +1500,43 @@ def create_interactive_figure(
     threshold_value_text.on_submit(apply_threshold_input)
     redraw_stable(threshold_ohm)
 
+    # This control changes only the lines shown in the figure.  The original
+    # calculated arrays remain the source for click readouts, stable-period
+    # detection, and exported CSV files.
+    smoothing_axis = fig.add_axes([0.17, 0.215, 0.58, 0.03])
+    smoothing_slider = Slider(
+        smoothing_axis,
+        "Smoothing (s)",
+        0.0,
+        0.5,
+        valinit=0.0,
+        valstep=0.1,
+        valfmt="%0.1f",
+    )
+    display_magnitude = data.magnitude_ohm.copy()
+    display_phase = data.phase_deg.copy()
+
+    def update_smoothing(new_window_s: float) -> None:
+        nonlocal display_magnitude, display_phase
+        display_magnitude, display_phase = smooth_impedance_for_display(
+            data,
+            float(new_window_s),
+        )
+        magnitude_line.set_ydata(display_magnitude)
+        phase_line.set_ydata(display_phase)
+        fig.canvas.draw_idle()
+
+    smoothing_slider.on_changed(update_smoothing)
+
     # The old RangeSlider was replaced by a checkbox plus a window-length
     # input and a continuous start-position slider.  When the checkbox is off
     # the full recording is shown, preserving the original default behavior.
-    custom_time_axis = fig.add_axes([0.02, 0.185, 0.16, 0.055])
+    custom_time_axis = fig.add_axes([0.02, 0.165, 0.16, 0.045])
     custom_time_check = CheckButtons(custom_time_axis, ["Custom Time Window"], [False])
     custom_time_check.labels[0].set_fontsize(8)
 
-    window_label = fig.text(0.19, 0.211, "Length (s)", fontsize=8, va="center")
-    window_text_axis = fig.add_axes([0.245, 0.185, 0.105, 0.045])
+    window_label = fig.text(0.19, 0.185, "Length (s)", fontsize=8, va="center")
+    window_text_axis = fig.add_axes([0.245, 0.165, 0.105, 0.04])
     window_text = TextBox(
         window_text_axis,
         "",
@@ -1226,10 +1546,18 @@ def create_interactive_figure(
     window_label.set_visible(False)
     window_text_axis.set_visible(False)
 
-    scroll_axis = fig.add_axes([0.50, 0.185, 0.43, 0.035])
+    scroll_label = fig.text(
+        0.40,
+        0.185,
+        "Window start (s)",
+        fontsize=8,
+        va="center",
+        visible=False,
+    )
+    scroll_axis = fig.add_axes([0.50, 0.165, 0.43, 0.03])
     scroll_slider = Slider(
         scroll_axis,
-        "Window start (s)",
+        "",
         time_start,
         time_start + data_span,
         valinit=time_start,
@@ -1240,7 +1568,7 @@ def create_interactive_figure(
 
     time_status = fig.text(
         0.50,
-        0.228,
+        0.211,
         "Custom time window off: showing the full recording",
         fontsize=8,
         va="center",
@@ -1305,6 +1633,7 @@ def create_interactive_figure(
         active = custom_time_check.get_status()[0]
         window_label.set_visible(active)
         window_text_axis.set_visible(active)
+        scroll_label.set_visible(active)
         scroll_axis.set_visible(active)
         if active:
             apply_custom_time_window(window_text.text)
@@ -1414,15 +1743,35 @@ def create_interactive_figure(
         for line in clicked_lines:
             line.set_xdata([x_value, x_value])
             line.set_visible(True)
-        click_text.set_text(
+        message = (
             f"t={x_value:.6f}s   |   |Z|={data.magnitude_ohm[index]:.6f}Ω   |   "
             f"phase={data.phase_deg[index]:.6f}°   |   "
             f"I={data.calibrated_i_counts[index]:.0f} counts   |   "
             f"Q={data.calibrated_q_counts[index]:.0f} counts"
         )
+        stable_period = stable_period_containing(periods, x_value)
+        if stable_period is not None:
+            message += f"   |   Average Impedance={stable_period.mean_ohm:.6f}Ω"
+        click_text.set_text(message)
         fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect("button_press_event", on_click)
+
+    copy_axis = fig.add_axes([0.80, 0.005, 0.17, 0.035])
+    copy_button = Button(copy_axis, "Copy to Clipboard")
+    copy_button.label.set_fontsize(8)
+
+    def copy_plot(_event: Any = None) -> None:
+        try:
+            png_bytes, rgba = render_plot_for_clipboard(fig, (ax_mag, ax_phase))
+            copy_image_to_clipboard(png_bytes, rgba)
+        except ClipboardError as exc:
+            click_text.set_text(f"Could not copy plot: {exc}")
+        else:
+            click_text.set_text("Plot copied to clipboard (plot and labels only).")
+        fig.canvas.draw_idle()
+
+    copy_button.on_clicked(copy_plot)
 
     # Matplotlib widget callbacks do not necessarily keep widget instances
     # alive.  Retaining them on the figure fixes the previously unresponsive
@@ -1430,12 +1779,14 @@ def create_interactive_figure(
     fig._max30009_widgets = {
         "threshold_slider": threshold_slider,
         "threshold_value_text": threshold_value_text,
+        "smoothing_slider": smoothing_slider,
         "custom_time_check": custom_time_check,
         "window_text": window_text,
         "scroll_slider": scroll_slider,
         "limit_check": limit_check,
         "upper_limit_text": upper_limit_text,
         "lower_limit_text": lower_limit_text,
+        "copy_button": copy_button,
     }
     return fig, periods
 
