@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Manage and open MAX30009 recording CSV pairs.
 
-The manager scans the directory containing this script by default.  It finds
-the calibrated ``.csv`` file that belongs to each ``.bioz.csv`` export,
-optionally waits until both files have stopped changing, and lists complete
-recordings in a small desktop window.  The directory is scanned at startup and again
-only when the user clicks ``Refresh Now``.  Selecting a recording launches the
-existing ``plots.py`` program with both CSV files from that recording.
+The manager scans the archive root containing this script by default and
+recursively finds calibrated ``.csv`` files that belong to each ``.bioz.csv``
+export.  Each pair must remain in the same session folder.  It optionally waits
+until both files have stopped changing, and lists complete recordings in a
+scrollable desktop window.  The archive is scanned at startup and again only
+when the user clicks ``Refresh Now``.  Selecting a recording launches the
+existing ``plots.py`` program with both CSV files from that recording; by
+default, generated output is written beside those source files.
 
 Annotations are stored in ``max30009_recording_annotations.json`` beside the
 script, so they remain available the next time the manager is opened.  The
 program uses only Python's standard library; Tkinter is used for the desktop
 window when it is available.
 
-Run from the directory containing this file and the plotting program.  The
-directory is scanned once at startup; click ``Refresh Now`` when you want to
-look for newly exported files:
+Run from the archive root containing this file and the plotting program.  The
+root and all of its subfolders are scanned once at startup; click ``Refresh
+Now`` when you want to look for newly exported files or folders:
 
     python watch_max30009.py
 
@@ -43,6 +45,10 @@ BIOZ_FILENAME_RE = re.compile(
     r"(?P<date>\d{8}|\d{4})[_-](?P<time>\d{6})\.bioz\.csv$",
     re.IGNORECASE,
 )
+RECORDING_TOKEN_RE = re.compile(
+    r"(?P<date>\d{8}|\d{4})[_-](?P<time>\d{6})(?!\d)",
+    re.IGNORECASE,
+)
 ANNOTATIONS_FILENAME = "max30009_recording_annotations.json"
 
 
@@ -54,18 +60,33 @@ class AnnotationFileError(ValueError):
 class RecordingPair:
     """The two files needed to open one MAX30009 recording."""
 
+    recording_identifier: str
     display_identifier: str
     normalized_identifier: str
     bioz_path: Path
     calibrated_path: Path
+    relative_bioz_path: str
+    relative_calibrated_path: str
 
     @property
     def key(self) -> str:
-        """Return a stable key for the annotation sidecar."""
+        """Return a stable archive-relative key for the annotation sidecar."""
 
         return "||".join(
             (
-                self.display_identifier,
+                self.recording_identifier,
+                self.relative_bioz_path,
+                self.relative_calibrated_path,
+            )
+        )
+
+    @property
+    def legacy_key(self) -> str:
+        """Return the pre-recursive annotation key for compatibility."""
+
+        return "||".join(
+            (
+                self.recording_identifier,
                 self.bioz_path.name,
                 self.calibrated_path.name,
             )
@@ -94,6 +115,18 @@ def recording_identifier(path: Path) -> Optional[str]:
     return f"{date_token}_{match.group('time')}"
 
 
+def filename_recording_identifier(path: Path) -> Optional[str]:
+    """Return a normalized recording token from any CSV filename."""
+
+    match = RECORDING_TOKEN_RE.search(path.name)
+    if match is None:
+        return None
+    date_token = match.group("date")
+    if len(date_token) == 8:
+        date_token = date_token[-4:]
+    return f"{date_token}_{match.group('time')}"
+
+
 def display_recording_identifier(path: Path) -> Optional[str]:
     """Return the filename's YYYYMMDD_HHMMSS or MMDD_HHMMSS identifier."""
 
@@ -110,9 +143,37 @@ def is_bioz_csv(path: Path) -> bool:
 def list_bioz_files(directory: Path) -> list[Path]:
     return sorted(
         path
-        for path in directory.iterdir()
+        for path in directory.rglob("*.bioz.csv")
         if is_bioz_csv(path)
     )
+
+
+def recording_display_name(
+    archive_root: Path,
+    bioz_path: Path,
+    recording_identifier_text: str,
+) -> str:
+    """Combine the relative folder path and recording identifier for display."""
+
+    relative_folder = bioz_path.parent.relative_to(archive_root)
+    if not relative_folder.parts:
+        return recording_identifier_text
+    return " > ".join((*relative_folder.parts, recording_identifier_text))
+
+
+def relative_path_string(archive_root: Path, path: Path) -> str:
+    """Return a stable, platform-independent archive-relative path."""
+
+    return path.relative_to(archive_root).as_posix()
+
+
+def annotation_for_pair(
+    annotations: dict[str, str],
+    pair: RecordingPair,
+) -> str:
+    """Read a current annotation, with compatibility for old sidecar keys."""
+
+    return annotations.get(pair.key, annotations.get(pair.legacy_key, ""))
 
 
 def find_companion_csv(
@@ -129,7 +190,10 @@ def find_companion_csv(
         and path != bioz_path
         and path.suffix.lower() == ".csv"
         and not path.name.lower().endswith(".bioz.csv")
-        and identifier in path.name
+        and (
+            identifier in path.name
+            or filename_recording_identifier(path) == identifier
+        )
     ]
     if len(candidates) == 1:
         return candidates[0], ""
@@ -183,7 +247,12 @@ def discover_recording_pairs(
     *,
     stable_seconds: float,
 ) -> tuple[list[RecordingPair], list[str]]:
-    """Return ready recording pairs and short descriptions of pending files."""
+    """Recursively return ready pairs and descriptions of pending files.
+
+    Pairing is deliberately restricted to the folder containing each BioZ
+    file, preventing similarly named recordings in separate sessions from
+    being matched together.
+    """
 
     ready: list[RecordingPair] = []
     pending: list[str] = []
@@ -195,12 +264,14 @@ def discover_recording_pairs(
             continue
 
         companion_path, status = find_companion_csv(
-            directory,
+            bioz_path.parent,
             bioz_path,
             normalized_identifier,
         )
         if companion_path is None:
-            pending.append(f"{bioz_path.name}: {status}")
+            pending.append(
+                f"{relative_path_string(directory, bioz_path)}: {status}"
+            )
             continue
 
         bioz_stable = file_is_stable(
@@ -215,16 +286,27 @@ def discover_recording_pairs(
         )
         if not bioz_stable or not companion_stable:
             pending.append(
-                f"{bioz_path.name}: waiting for both files to finish writing"
+                f"{relative_path_string(directory, bioz_path)}: waiting for both "
+                "files to finish writing"
             )
             continue
 
         ready.append(
             RecordingPair(
-                display_identifier=display_identifier,
+                recording_identifier=display_identifier,
+                display_identifier=recording_display_name(
+                    directory,
+                    bioz_path,
+                    display_identifier,
+                ),
                 normalized_identifier=normalized_identifier,
                 bioz_path=bioz_path,
                 calibrated_path=companion_path,
+                relative_bioz_path=relative_path_string(directory, bioz_path),
+                relative_calibrated_path=relative_path_string(
+                    directory,
+                    companion_path,
+                ),
             )
         )
 
@@ -236,11 +318,13 @@ def load_annotations(path: Path) -> dict[str, str]:
 
     The current format is::
 
-        {"version": 1, "recordings": {"pair-key": {"annotation": "..."}}}
+        {"version": 2, "recordings": {"archive-relative-pair-key": {
+            "annotation": "..."
+        }}}
 
-    A simple mapping from pair keys to strings is accepted for compatibility
-    with early development versions.  Other malformed content is reported to
-    the caller so the GUI can ask whether to exit or continue.
+    Version 1 and a simple mapping from pair keys to strings are accepted for
+    compatibility with earlier versions.  Other malformed content is reported
+    to the caller so the GUI can ask whether to exit or continue.
     """
 
     if not path.exists():
@@ -263,8 +347,8 @@ def load_annotations(path: Path) -> dict[str, str]:
     if is_legacy:
         recordings = payload
     else:
-        if payload.get("version") != 1:
-            raise AnnotationFileError("the annotation file must have version 1")
+        if payload.get("version") not in {1, 2}:
+            raise AnnotationFileError("the annotation file must have version 1 or 2")
         recordings = payload.get("recordings")
 
     if not isinstance(recordings, dict):
@@ -295,7 +379,7 @@ def save_annotations(path: Path, annotations: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Optional[Path] = None
     payload = {
-        "version": 1,
+        "version": 2,
         "recordings": {
             key: {"annotation": annotations[key]}
             for key in sorted(annotations)
@@ -328,18 +412,19 @@ def launch_viewer(
     pair: RecordingPair,
     *,
     viewer: Path,
-    output_directory: Path,
+    output_directory: Optional[Path],
     working_directory: Path,
 ) -> None:
     """Launch the existing plotting program for a selected recording."""
 
+    selected_output_directory = output_directory or pair.bioz_path.parent
     command = [
         sys.executable,
         str(viewer),
         str(pair.bioz_path),
         str(pair.calibrated_path),
         "--output-dir",
-        str(output_directory),
+        str(selected_output_directory),
     ]
     subprocess.Popen(command, cwd=str(working_directory))
 
@@ -356,7 +441,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--directory",
         type=Path,
         default=script_directory,
-        help="directory to scan; defaults to the directory containing this script",
+        help=(
+            "archive root to scan recursively; defaults to the directory "
+            "containing this script"
+        ),
     )
     parser.add_argument(
         "--viewer",
@@ -368,7 +456,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="directory for viewer output; defaults to the scanned directory",
+        help=(
+            "optional common directory for viewer output; by default, generated "
+            "files are stored beside the selected recording"
+        ),
     )
     parser.add_argument(
         "--annotations",
@@ -413,7 +504,7 @@ class RecordingManagerGUI:
         *,
         directory: Path,
         viewer: Path,
-        output_directory: Path,
+        output_directory: Optional[Path],
         annotations_path: Path,
         annotations: dict[str, str],
         stable_seconds: float,
@@ -432,7 +523,7 @@ class RecordingManagerGUI:
         self.stability_states: dict[Path, StabilityState] = {}
         self.pairs: list[RecordingPair] = []
         self.pairs_by_key: dict[str, RecordingPair] = {}
-        self.item_to_key: dict[str, str] = {}
+        self.recording_tag_to_key: dict[str, str] = {}
         self.selected_key: Optional[str] = None
         self.annotation_editor_visible = False
 
@@ -468,8 +559,9 @@ class RecordingManagerGUI:
         self.ttk.Label(
             main,
             text=(
-                f"Folder: {self.directory}\n"
-                "Only complete, stable .bioz.csv + calibrated .csv pairs are listed."
+                f"Archive root: {self.directory}\n"
+                "Only complete, stable .bioz.csv + calibrated .csv pairs are listed. "
+                "Names include their relative session folders and wrap at 100 characters."
             ),
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(4, 8))
@@ -479,27 +571,37 @@ class RecordingManagerGUI:
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
 
-        self.tree = self.ttk.Treeview(
+        # A Text widget is used instead of a Treeview because Tk's Treeview
+        # cells do not reliably wrap long path names.  Each recording is a
+        # tagged, read-only-in-practice block that still supports mouse and
+        # keyboard selection.
+        self.recording_text = self.tk.Text(
             table_frame,
-            columns=("recording", "annotation"),
-            show="headings",
-            selectmode="browse",
+            width=100,
+            height=15,
+            wrap="char",
+            padx=6,
+            pady=4,
+            takefocus=True,
+            cursor="arrow",
         )
-        self.tree.heading("recording", text="Recording")
-        self.tree.heading("annotation", text="Annotation")
-        self.tree.column("recording", width=185, anchor="w", stretch=False)
-        self.tree.column("annotation", width=650, anchor="w", stretch=True)
-        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.recording_text.tag_configure(
+            "selected_recording",
+            background="#d9eaf7",
+        )
+        self.recording_text.grid(row=0, column=0, sticky="nsew")
         scrollbar = self.ttk.Scrollbar(
             table_frame,
             orient="vertical",
-            command=self.tree.yview,
+            command=self.recording_text.yview,
         )
         scrollbar.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.bind("<<TreeviewSelect>>", self._on_selection_changed)
-        self.tree.bind("<Return>", self._open_selected_event)
-        self.tree.bind("<KP_Enter>", self._open_selected_event)
+        self.recording_text.configure(yscrollcommand=scrollbar.set)
+        self.recording_text.bind("<Button-1>", self._recording_click)
+        self.recording_text.bind("<KeyPress>", self._recording_key)
+        self.recording_text.bind("<MouseWheel>", self._recording_mousewheel)
+        self.recording_text.bind("<Button-4>", self._recording_mousewheel)
+        self.recording_text.bind("<Button-5>", self._recording_mousewheel)
 
         self.action_frame = self.ttk.LabelFrame(
             main,
@@ -605,6 +707,136 @@ class RecordingManagerGUI:
             justify="left",
         ).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
+    def _recording_text_for_pair(self, pair: RecordingPair) -> str:
+        annotation = annotation_for_pair(self.annotations, pair)
+        if not annotation:
+            return pair.display_identifier
+        return f"{pair.display_identifier}\n  Annotation: {annotation}"
+
+    def _render_recording_list(self) -> None:
+        self.recording_text.delete("1.0", "end")
+        for tag in tuple(self.recording_tag_to_key):
+            self.recording_text.tag_delete(tag)
+        self.recording_tag_to_key.clear()
+        self.recording_text.tag_remove("selected_recording", "1.0", "end")
+
+        if not self.pairs:
+            self.recording_text.insert(
+                "1.0",
+                "No complete recording pairs found yet.",
+            )
+            return
+
+        for index, pair in enumerate(self.pairs):
+            tag = f"recording_{index}"
+            label = self._recording_text_for_pair(pair)
+            start = self.recording_text.index("end-1c")
+            self.recording_text.insert("end-1c", label)
+            end = self.recording_text.index("end-1c")
+            self.recording_text.insert("end-1c", "\n")
+            self.recording_text.tag_add(tag, start, end)
+            self.recording_text.tag_configure(
+                tag,
+                foreground="#000000",
+                spacing3=5,
+            )
+            self.recording_tag_to_key[tag] = pair.key
+
+    def _recording_key_at_index(self, index: str) -> Optional[str]:
+        for tag, key in self.recording_tag_to_key.items():
+            ranges = self.recording_text.tag_ranges(tag)
+            if len(ranges) != 2:
+                continue
+            if self.recording_text.compare(ranges[0], "<=", index) and self.recording_text.compare(
+                index,
+                "<",
+                ranges[1],
+            ):
+                return key
+
+        # A click can land on the newline immediately after a wrapped item.
+        # Treat it as part of that item so selection does not feel fragile.
+        if self.recording_text.compare(index, ">", "1.0"):
+            previous = self.recording_text.index(f"{index} - 1 chars")
+            for tag, key in self.recording_tag_to_key.items():
+                ranges = self.recording_text.tag_ranges(tag)
+                if len(ranges) == 2 and self.recording_text.compare(
+                    ranges[0], "<=", previous
+                ) and self.recording_text.compare(previous, "<", ranges[1]):
+                    return key
+        return None
+
+    def _select_recording_key(self, key: Optional[str]) -> None:
+        if key is None or key not in self.pairs_by_key:
+            self.selected_key = None
+            self.recording_text.tag_remove("selected_recording", "1.0", "end")
+            self._on_selection_changed()
+            return
+
+        self.selected_key = key
+        self.recording_text.tag_remove("selected_recording", "1.0", "end")
+        for tag, tag_key in self.recording_tag_to_key.items():
+            if tag_key != key:
+                continue
+            ranges = self.recording_text.tag_ranges(tag)
+            if len(ranges) == 2:
+                self.recording_text.tag_add(
+                    "selected_recording",
+                    ranges[0],
+                    ranges[1],
+                )
+                self.recording_text.see(ranges[0])
+            break
+        self._on_selection_changed()
+
+    def _recording_click(self, event: Any) -> str:
+        index = self.recording_text.index(f"@{event.x},{event.y}")
+        self.recording_text.focus_set()
+        self._select_recording_key(self._recording_key_at_index(index))
+        return "break"
+
+    def _recording_key(self, event: Any) -> str:
+        if event.keysym in {"Return", "KP_Enter"}:
+            self._display_plot()
+            return "break"
+
+        if event.keysym in {"Up", "Down", "Home", "End"}:
+            keys = [pair.key for pair in self.pairs]
+            if not keys:
+                return "break"
+            if self.selected_key not in keys:
+                index = 0 if event.keysym in {"Down", "Home"} else len(keys) - 1
+            else:
+                index = keys.index(self.selected_key)
+                if event.keysym == "Up":
+                    index = max(0, index - 1)
+                elif event.keysym == "Down":
+                    index = min(len(keys) - 1, index + 1)
+                elif event.keysym == "Home":
+                    index = 0
+                elif event.keysym == "End":
+                    index = len(keys) - 1
+            self._select_recording_key(keys[index])
+            return "break"
+
+        # The catalogue is intentionally read-only.  Navigation keys are
+        # handled above; all other key presses must not edit its contents.
+        return "break"
+
+    def _recording_mousewheel(self, event: Any) -> str:
+        button = getattr(event, "num", None)
+        if button == 4:
+            units = -3
+        elif button == 5:
+            units = 3
+        else:
+            delta = int(getattr(event, "delta", 0))
+            if delta == 0:
+                return "break"
+            units = -max(1, abs(delta) // 120) if delta > 0 else max(1, abs(delta) // 120)
+        self.recording_text.yview_scroll(units, "units")
+        return "break"
+
     def _selected_pair(self) -> Optional[RecordingPair]:
         if self.selected_key is None:
             return None
@@ -666,21 +898,21 @@ class RecordingManagerGUI:
         return "break"
 
     def _on_selection_changed(self, _event: Any = None) -> None:
-        selection = self.tree.selection()
-        if not selection:
+        if self.selected_key is None:
+            self._hide_selected_controls()
+            self.details_var.set("No recording selected.")
+            return
+
+        pair = self.pairs_by_key.get(self.selected_key)
+        if pair is None:
             self.selected_key = None
             self._hide_selected_controls()
             self.details_var.set("No recording selected.")
             return
 
-        key = self.item_to_key.get(selection[0])
-        pair = self.pairs_by_key.get(key) if key is not None else None
-        if pair is None:
-            return
-        self.selected_key = pair.key
         self.action_frame.grid()
         self._hide_annotation_editor()
-        annotation = self.annotations.get(pair.key, "")
+        annotation = annotation_for_pair(self.annotations, pair)
         self.annotation_display_var.set(
             f"Annotation: {annotation}" if annotation else "Annotation: none"
         )
@@ -698,7 +930,7 @@ class RecordingManagerGUI:
         pair = self._selected_pair()
         if pair is None:
             return
-        self._set_annotation_editor_text(self.annotations.get(pair.key, ""))
+        self._set_annotation_editor_text(annotation_for_pair(self.annotations, pair))
         self.annotation_editor.grid(
             row=2,
             column=0,
@@ -720,8 +952,11 @@ class RecordingManagerGUI:
         annotation_text = self.annotation_text.get("1.0", "end-1c")
         if annotation_text.strip():
             self.annotations[pair.key] = annotation_text
+            if pair.legacy_key != pair.key:
+                self.annotations.pop(pair.legacy_key, None)
         else:
             self.annotations.pop(pair.key, None)
+            self.annotations.pop(pair.legacy_key, None)
         try:
             save_annotations(self.annotations_path, self.annotations)
         except OSError as exc:
@@ -731,13 +966,8 @@ class RecordingManagerGUI:
             )
             return False
 
-        for item_id, key in self.item_to_key.items():
-            if key == pair.key:
-                self.tree.item(
-                    item_id,
-                    values=(pair.display_identifier, annotation_text),
-                )
-                break
+        self._render_recording_list()
+        self._select_recording_key(pair.key)
         self.annotation_display_var.set(
             f"Annotation: {annotation_text}" if annotation_text else "Annotation: none"
         )
@@ -783,31 +1013,15 @@ class RecordingManagerGUI:
             return
 
         pairs.sort(
-            key=lambda pair: (pair.display_identifier, pair.bioz_path.name),
+            key=lambda pair: (pair.recording_identifier, pair.display_identifier),
             reverse=True,
         )
         self.pairs = pairs
         self.pairs_by_key = {pair.key: pair for pair in pairs}
-        self.item_to_key.clear()
-        self.tree.delete(*self.tree.get_children())
+        self._render_recording_list()
 
-        selected_item: Optional[str] = None
-        for index, pair in enumerate(pairs):
-            item_id = f"pair_{index}"
-            self.item_to_key[item_id] = pair.key
-            self.tree.insert(
-                "",
-                "end",
-                iid=item_id,
-                values=(pair.display_identifier, self.annotations.get(pair.key, "")),
-            )
-            if pair.key == previous_key:
-                selected_item = item_id
-
-        if selected_item is not None:
-            self.tree.selection_set(selected_item)
-            self.tree.focus(selected_item)
-            self._on_selection_changed()
+        if previous_key in self.pairs_by_key:
+            self._select_recording_key(previous_key)
             if editor_was_visible:
                 self._show_annotation_editor()
                 self._set_annotation_editor_text(editor_draft)
@@ -836,7 +1050,7 @@ def run_console(
     *,
     directory: Path,
     viewer: Path,
-    output_directory: Path,
+    output_directory: Optional[Path],
     annotations_path: Path,
     stable_seconds: float,
 ) -> int:
@@ -871,13 +1085,13 @@ def run_console(
             return 1
 
         pairs.sort(
-            key=lambda pair: (pair.display_identifier, pair.bioz_path.name),
+            key=lambda pair: (pair.recording_identifier, pair.display_identifier),
             reverse=True,
         )
         print("\nMAX30009 recordings")
         if pairs:
             for index, pair in enumerate(pairs, start=1):
-                annotation = annotations.get(pair.key, "")
+                annotation = annotation_for_pair(annotations, pair)
                 suffix = f" — {annotation}" if annotation else ""
                 print(f"  {index}. {pair.display_identifier}{suffix}")
         else:
@@ -916,8 +1130,11 @@ def run_console(
                 return 0
             if annotation:
                 annotations[pair.key] = annotation
+                if pair.legacy_key != pair.key:
+                    annotations.pop(pair.legacy_key, None)
             else:
                 annotations.pop(pair.key, None)
+                annotations.pop(pair.legacy_key, None)
             try:
                 save_annotations(annotations_path, annotations)
             except OSError as exc:
@@ -943,7 +1160,7 @@ def run_gui(
     *,
     directory: Path,
     viewer: Path,
-    output_directory: Path,
+    output_directory: Optional[Path],
     annotations_path: Path,
     stable_seconds: float,
 ) -> int:
@@ -1014,7 +1231,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_directory = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else directory
+        else None
     )
     annotations_path = (
         args.annotations.expanduser().resolve()
