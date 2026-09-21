@@ -5,10 +5,12 @@ The manager scans the archive root containing this script by default and
 recursively finds calibrated ``.csv`` files that belong to each ``.bioz.csv``
 export.  Each pair must remain in the same session folder.  It optionally waits
 until both files have stopped changing, and lists complete recordings in a
-scrollable desktop window.  The archive is scanned at startup and again only
-when the user clicks ``Refresh Now``.  Selecting a recording launches the
-existing ``plots.py`` program with both CSV files from that recording; by
-default, generated output is written beside those source files.
+scrollable desktop window.  The GUI supports a flat archive-wide list as well
+as a navigable ``Folder View`` and can filter recordings by partial filename,
+relative folder name, or annotation text.  The archive is scanned at startup
+and again only when the user clicks ``Refresh Now``.  Selecting a recording
+launches the existing ``plots.py`` program with both CSV files from that
+recording; by default, generated output is written beside those source files.
 
 Annotations are stored in ``max30009_recording_annotations.json`` beside the
 script, so they remain available the next time the manager is opened.  The
@@ -29,6 +31,7 @@ If Tkinter is unavailable, a text menu is used instead:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -37,7 +40,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 
@@ -91,6 +94,17 @@ class RecordingPair:
                 self.calibrated_path.name,
             )
         )
+
+
+@dataclass(frozen=True)
+class CatalogueEntry:
+    """One selectable file, folder, or parent entry in the catalogue."""
+
+    kind: str
+    entry_id: str
+    label: str
+    pair: Optional[RecordingPair] = None
+    folder_path: Optional[PurePosixPath] = None
 
 
 @dataclass
@@ -523,7 +537,11 @@ class RecordingManagerGUI:
         self.stability_states: dict[Path, StabilityState] = {}
         self.pairs: list[RecordingPair] = []
         self.pairs_by_key: dict[str, RecordingPair] = {}
-        self.recording_tag_to_key: dict[str, str] = {}
+        self.entry_tag_to_entry: dict[str, CatalogueEntry] = {}
+        self.entries: list[CatalogueEntry] = []
+        self.folder_path = PurePosixPath()
+        self.selected_entry: Optional[CatalogueEntry] = None
+        self.selected_entry_id: Optional[str] = None
         self.selected_key: Optional[str] = None
         self.annotation_editor_visible = False
 
@@ -540,7 +558,7 @@ class RecordingManagerGUI:
         main = self.ttk.Frame(self.root, padding=12)
         main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(3, weight=1)
 
         heading = self.ttk.Frame(main)
         heading.grid(row=0, column=0, sticky="ew")
@@ -561,13 +579,48 @@ class RecordingManagerGUI:
             text=(
                 f"Archive root: {self.directory}\n"
                 "Only complete, stable .bioz.csv + calibrated .csv pairs are listed. "
-                "Names include their relative session folders and wrap at 100 characters."
+                "Names include relative session folders and wrap at 100 characters. "
+                "Use Search and Folder View to narrow the catalogue."
             ),
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(4, 8))
 
+        search_frame = self.ttk.Frame(main)
+        search_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        search_frame.columnconfigure(1, weight=1)
+        self.ttk.Label(search_frame, text="Search name/annotation:").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+        )
+        self.search_var = self.tk.StringVar(value="")
+        self.search_entry = self.ttk.Entry(
+            search_frame,
+            textvariable=self.search_var,
+        )
+        self.search_entry.grid(row=0, column=1, sticky="ew")
+        self.search_entry.bind("<KeyRelease>", self._on_search_changed)
+        self.ttk.Button(
+            search_frame,
+            text="Clear",
+            command=self._clear_search,
+        ).grid(row=0, column=2, sticky="w", padx=(6, 12))
+        self.folder_view_var = self.tk.BooleanVar(value=False)
+        self.ttk.Checkbutton(
+            search_frame,
+            text="Folder View",
+            variable=self.folder_view_var,
+            command=self._toggle_folder_view,
+        ).grid(row=0, column=3, sticky="w")
+        self.folder_location_var = self.tk.StringVar(value="Folder: archive root")
+        self.ttk.Label(
+            search_frame,
+            textvariable=self.folder_location_var,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
         table_frame = self.ttk.Frame(main)
-        table_frame.grid(row=2, column=0, sticky="nsew")
+        table_frame.grid(row=3, column=0, sticky="nsew")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
 
@@ -608,7 +661,7 @@ class RecordingManagerGUI:
             text="Selected recording",
             padding=8,
         )
-        self.action_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.action_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         self.action_frame.columnconfigure(0, weight=1)
         self.action_frame.columnconfigure(1, weight=1)
 
@@ -699,51 +752,181 @@ class RecordingManagerGUI:
             main,
             textvariable=self.details_var,
             justify="left",
-        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(8, 0))
         self.status_var = self.tk.StringVar(value="Scanning...")
         self.ttk.Label(
             main,
             textvariable=self.status_var,
             justify="left",
-        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=6, column=0, sticky="w", pady=(4, 0))
 
-    def _recording_text_for_pair(self, pair: RecordingPair) -> str:
+    def _folder_for_pair(self, pair: RecordingPair) -> PurePosixPath:
+        """Return the archive-relative folder containing a recording pair."""
+
+        return PurePosixPath(pair.relative_bioz_path).parent
+
+    @staticmethod
+    def _is_within_folder(
+        folder: PurePosixPath,
+        ancestor: PurePosixPath,
+    ) -> bool:
+        """Return whether ``folder`` is ``ancestor`` or one of its children."""
+
+        if not ancestor.parts:
+            return True
+        return folder.parts[: len(ancestor.parts)] == ancestor.parts
+
+    def _folder_label(self, folder: PurePosixPath) -> str:
+        if not folder.parts:
+            return "archive root"
+        return " > ".join(folder.parts)
+
+    @staticmethod
+    def _folder_entry_id(folder: PurePosixPath) -> str:
+        return f"folder:{folder.as_posix()}"
+
+    def _pair_matches_search(self, pair: RecordingPair) -> bool:
+        query = self.search_var.get().strip().casefold()
+        if not query:
+            return True
         annotation = annotation_for_pair(self.annotations, pair)
-        if not annotation:
-            return pair.display_identifier
-        return f"{pair.display_identifier}\n  Annotation: {annotation}"
+        searchable_text = "\n".join(
+            (
+                pair.display_identifier,
+                pair.recording_identifier,
+                pair.relative_bioz_path,
+                pair.relative_calibrated_path,
+                annotation,
+            )
+        ).casefold()
+        return query in searchable_text
+
+    def _entry_text(self, entry: CatalogueEntry) -> str:
+        if entry.kind == "parent":
+            return "[Parent] .. (parent folder)"
+        if entry.kind == "folder":
+            return f"[Folder] {entry.label}"
+
+        pair = entry.pair
+        if pair is None:
+            return entry.label
+        label = pair.recording_identifier if self.folder_view_var.get() else pair.display_identifier
+        annotation = annotation_for_pair(self.annotations, pair)
+        if annotation:
+            return f"{label}\n  Annotation: {annotation}"
+        return label
+
+    def _build_catalogue_entries(self) -> list[CatalogueEntry]:
+        if not self.folder_view_var.get():
+            self.folder_location_var.set("Folder View off: all folders")
+            return [
+                CatalogueEntry(
+                    kind="file",
+                    entry_id=pair.key,
+                    label=pair.display_identifier,
+                    pair=pair,
+                )
+                for pair in self.pairs
+                if self._pair_matches_search(pair)
+            ]
+
+        current_folder = self.folder_path
+        self.folder_location_var.set(
+            f"Folder: {self._folder_label(current_folder)}"
+        )
+        matching_pairs = [
+            pair
+            for pair in self.pairs
+            if self._is_within_folder(
+                self._folder_for_pair(pair),
+                current_folder,
+            )
+            and self._pair_matches_search(pair)
+        ]
+
+        entries: list[CatalogueEntry] = []
+        if current_folder.parts:
+            parent = current_folder.parent
+            entries.append(
+                CatalogueEntry(
+                    kind="parent",
+                    entry_id=self._folder_entry_id(parent),
+                    label=".. (parent folder)",
+                    folder_path=parent,
+                )
+            )
+
+        child_folders: dict[str, PurePosixPath] = {}
+        direct_pairs: list[RecordingPair] = []
+        for pair in matching_pairs:
+            pair_folder = self._folder_for_pair(pair)
+            if pair_folder == current_folder:
+                direct_pairs.append(pair)
+                continue
+            remaining_parts = pair_folder.parts[len(current_folder.parts) :]
+            if not remaining_parts:
+                continue
+            child_folder = PurePosixPath(
+                *(current_folder.parts + (remaining_parts[0],))
+            )
+            child_folders[child_folder.as_posix()] = child_folder
+
+        for child_folder in sorted(child_folders.values(), key=lambda path: path.as_posix().casefold()):
+            entries.append(
+                CatalogueEntry(
+                    kind="folder",
+                    entry_id=self._folder_entry_id(child_folder),
+                    label=child_folder.name,
+                    folder_path=child_folder,
+                )
+            )
+        entries.extend(
+            CatalogueEntry(
+                kind="file",
+                entry_id=pair.key,
+                label=pair.recording_identifier,
+                pair=pair,
+            )
+            for pair in direct_pairs
+        )
+        return entries
 
     def _render_recording_list(self) -> None:
+        self.entries = self._build_catalogue_entries()
         self.recording_text.delete("1.0", "end")
-        for tag in tuple(self.recording_tag_to_key):
+        for tag in tuple(self.entry_tag_to_entry):
             self.recording_text.tag_delete(tag)
-        self.recording_tag_to_key.clear()
+        self.entry_tag_to_entry.clear()
         self.recording_text.tag_remove("selected_recording", "1.0", "end")
 
-        if not self.pairs:
-            self.recording_text.insert(
-                "1.0",
-                "No complete recording pairs found yet.",
-            )
+        if not self.entries:
+            if not self.pairs:
+                message = "No complete recording pairs found yet."
+            elif self.search_var.get().strip():
+                message = "No recordings match the current search."
+            elif self.folder_view_var.get():
+                message = "No complete recording pairs in this folder."
+            else:
+                message = "No recordings match the current search."
+            self.recording_text.insert("1.0", message)
             return
 
-        for index, pair in enumerate(self.pairs):
-            tag = f"recording_{index}"
-            label = self._recording_text_for_pair(pair)
+        for index, entry in enumerate(self.entries):
+            tag = f"entry_{index}"
             start = self.recording_text.index("end-1c")
-            self.recording_text.insert("end-1c", label)
+            self.recording_text.insert("end-1c", self._entry_text(entry))
             end = self.recording_text.index("end-1c")
             self.recording_text.insert("end-1c", "\n")
             self.recording_text.tag_add(tag, start, end)
             self.recording_text.tag_configure(
                 tag,
-                foreground="#000000",
+                foreground="#154b7a" if entry.kind != "file" else "#000000",
                 spacing3=5,
             )
-            self.recording_tag_to_key[tag] = pair.key
+            self.entry_tag_to_entry[tag] = entry
 
-    def _recording_key_at_index(self, index: str) -> Optional[str]:
-        for tag, key in self.recording_tag_to_key.items():
+    def _catalogue_entry_at_index(self, index: str) -> Optional[CatalogueEntry]:
+        for tag, entry in self.entry_tag_to_entry.items():
             ranges = self.recording_text.tag_ranges(tag)
             if len(ranges) != 2:
                 continue
@@ -752,31 +935,40 @@ class RecordingManagerGUI:
                 "<",
                 ranges[1],
             ):
-                return key
+                return entry
 
         # A click can land on the newline immediately after a wrapped item.
         # Treat it as part of that item so selection does not feel fragile.
         if self.recording_text.compare(index, ">", "1.0"):
             previous = self.recording_text.index(f"{index} - 1 chars")
-            for tag, key in self.recording_tag_to_key.items():
+            for tag, entry in self.entry_tag_to_entry.items():
                 ranges = self.recording_text.tag_ranges(tag)
                 if len(ranges) == 2 and self.recording_text.compare(
                     ranges[0], "<=", previous
                 ) and self.recording_text.compare(previous, "<", ranges[1]):
-                    return key
+                    return entry
         return None
 
-    def _select_recording_key(self, key: Optional[str]) -> None:
-        if key is None or key not in self.pairs_by_key:
-            self.selected_key = None
-            self.recording_text.tag_remove("selected_recording", "1.0", "end")
+    def _clear_selection(self) -> None:
+        self.selected_entry = None
+        self.selected_entry_id = None
+        self.selected_key = None
+        self.recording_text.tag_remove("selected_recording", "1.0", "end")
+
+    def _select_catalogue_entry(self, entry: Optional[CatalogueEntry]) -> None:
+        entries_by_id = {candidate.entry_id: candidate for candidate in self.entries}
+        if entry is None or entry.entry_id not in entries_by_id:
+            self._clear_selection()
             self._on_selection_changed()
             return
 
-        self.selected_key = key
+        entry = entries_by_id[entry.entry_id]
+        self.selected_entry = entry
+        self.selected_entry_id = entry.entry_id
+        self.selected_key = entry.pair.key if entry.kind == "file" and entry.pair else None
         self.recording_text.tag_remove("selected_recording", "1.0", "end")
-        for tag, tag_key in self.recording_tag_to_key.items():
-            if tag_key != key:
+        for tag, tag_entry in self.entry_tag_to_entry.items():
+            if tag_entry.entry_id != entry.entry_id:
                 continue
             ranges = self.recording_text.tag_ranges(tag)
             if len(ranges) == 2:
@@ -792,31 +984,38 @@ class RecordingManagerGUI:
     def _recording_click(self, event: Any) -> str:
         index = self.recording_text.index(f"@{event.x},{event.y}")
         self.recording_text.focus_set()
-        self._select_recording_key(self._recording_key_at_index(index))
+        entry = self._catalogue_entry_at_index(index)
+        if entry is not None and entry.kind in {"folder", "parent"}:
+            self._enter_folder(entry.folder_path or PurePosixPath())
+        else:
+            self._select_catalogue_entry(entry)
         return "break"
 
     def _recording_key(self, event: Any) -> str:
         if event.keysym in {"Return", "KP_Enter"}:
-            self._display_plot()
+            if self.selected_entry and self.selected_entry.kind in {"folder", "parent"}:
+                self._enter_folder(self.selected_entry.folder_path or PurePosixPath())
+            else:
+                self._display_plot()
             return "break"
 
         if event.keysym in {"Up", "Down", "Home", "End"}:
-            keys = [pair.key for pair in self.pairs]
-            if not keys:
+            if not self.entries:
                 return "break"
-            if self.selected_key not in keys:
-                index = 0 if event.keysym in {"Down", "Home"} else len(keys) - 1
+            entry_ids = [entry.entry_id for entry in self.entries]
+            if self.selected_entry_id not in entry_ids:
+                index = 0 if event.keysym in {"Down", "Home"} else len(self.entries) - 1
             else:
-                index = keys.index(self.selected_key)
+                index = entry_ids.index(self.selected_entry_id)
                 if event.keysym == "Up":
                     index = max(0, index - 1)
                 elif event.keysym == "Down":
-                    index = min(len(keys) - 1, index + 1)
+                    index = min(len(self.entries) - 1, index + 1)
                 elif event.keysym == "Home":
                     index = 0
                 elif event.keysym == "End":
-                    index = len(keys) - 1
-            self._select_recording_key(keys[index])
+                    index = len(self.entries) - 1
+            self._select_catalogue_entry(self.entries[index])
             return "break"
 
         # The catalogue is intentionally read-only.  Navigation keys are
@@ -837,7 +1036,62 @@ class RecordingManagerGUI:
         self.recording_text.yview_scroll(units, "units")
         return "break"
 
+    def _enter_folder(self, folder: PurePosixPath) -> None:
+        self.folder_path = PurePosixPath(*folder.parts)
+        self._clear_selection()
+        self._render_recording_list()
+        self._hide_selected_controls()
+        self.details_var.set(
+            f"Folder: {self._folder_label(self.folder_path)}. "
+            "Select a recording or open a subfolder."
+        )
+        self.recording_text.focus_set()
+
+    def _toggle_folder_view(self) -> None:
+        if not self.folder_view_var.get():
+            self.folder_path = PurePosixPath()
+        self._clear_selection()
+        self._render_recording_list()
+        self._hide_selected_controls()
+        if self.folder_view_var.get():
+            self.details_var.set(
+                "Folder View is active. Select a folder or recording."
+            )
+        else:
+            self.details_var.set("Select a recording to see its files.")
+        self.recording_text.focus_set()
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+        self._on_search_changed()
+        self.search_entry.focus_set()
+
+    def _on_search_changed(self, _event: Any = None) -> None:
+        previous_entry_id = self.selected_entry_id
+        self._render_recording_list()
+        visible_entries = {
+            entry.entry_id: entry
+            for entry in self.entries
+        }
+        if previous_entry_id in visible_entries:
+            self._select_catalogue_entry(visible_entries[previous_entry_id])
+            return
+
+        self._clear_selection()
+        self._hide_selected_controls()
+        if self.search_var.get().strip():
+            self.details_var.set("No selected recording matches the current search.")
+        elif self.folder_view_var.get():
+            self.details_var.set(
+                f"Folder: {self._folder_label(self.folder_path)}. "
+                "Select a folder or recording."
+            )
+        else:
+            self.details_var.set("Select a recording to see its files.")
+
     def _selected_pair(self) -> Optional[RecordingPair]:
+        if self.selected_entry and self.selected_entry.kind == "file":
+            return self.selected_entry.pair
         if self.selected_key is None:
             return None
         return self.pairs_by_key.get(self.selected_key)
@@ -898,18 +1152,30 @@ class RecordingManagerGUI:
         return "break"
 
     def _on_selection_changed(self, _event: Any = None) -> None:
-        if self.selected_key is None:
+        entry = self.selected_entry
+        if entry is None:
             self._hide_selected_controls()
             self.details_var.set("No recording selected.")
             return
 
-        pair = self.pairs_by_key.get(self.selected_key)
-        if pair is None:
+        if entry.kind != "file" or entry.pair is None:
             self.selected_key = None
             self._hide_selected_controls()
-            self.details_var.set("No recording selected.")
+            folder = entry.folder_path or PurePosixPath()
+            if entry.kind == "parent":
+                self.details_var.set(
+                    f"Parent folder: {self._folder_label(folder)}. "
+                    "Press Enter to open it."
+                )
+            else:
+                self.details_var.set(
+                    f"Folder: {self._folder_label(folder)}. "
+                    "Press Enter to open it."
+                )
             return
 
+        pair = entry.pair
+        self.selected_key = pair.key
         self.action_frame.grid()
         self._hide_annotation_editor()
         annotation = annotation_for_pair(self.annotations, pair)
@@ -967,10 +1233,19 @@ class RecordingManagerGUI:
             return False
 
         self._render_recording_list()
-        self._select_recording_key(pair.key)
-        self.annotation_display_var.set(
-            f"Annotation: {annotation_text}" if annotation_text else "Annotation: none"
+        visible_entry = next(
+            (
+                entry
+                for entry in self.entries
+                if entry.kind == "file" and entry.entry_id == pair.key
+            ),
+            None,
         )
+        if visible_entry is not None:
+            self._select_catalogue_entry(visible_entry)
+        else:
+            self._clear_selection()
+            self._hide_selected_controls()
         self._hide_annotation_editor()
         self.status_var.set(f"Annotation saved for {pair.display_identifier}.")
         return True
@@ -995,7 +1270,7 @@ class RecordingManagerGUI:
         self.status_var.set(f"Opened {pair.display_identifier} in the plotting program.")
 
     def refresh(self) -> None:
-        previous_key = self.selected_key
+        previous_entry_id = self.selected_entry_id
         editor_was_visible = self.annotation_editor_visible
         editor_draft = (
             self.annotation_text.get("1.0", "end-1c")
@@ -1018,24 +1293,46 @@ class RecordingManagerGUI:
         )
         self.pairs = pairs
         self.pairs_by_key = {pair.key: pair for pair in pairs}
+        if self.folder_view_var.get() and self.folder_path.parts:
+            current_folder_still_exists = any(
+                self._is_within_folder(
+                    self._folder_for_pair(pair),
+                    self.folder_path,
+                )
+                for pair in pairs
+            )
+            if not current_folder_still_exists:
+                self.folder_path = PurePosixPath()
         self._render_recording_list()
 
-        if previous_key in self.pairs_by_key:
-            self._select_recording_key(previous_key)
+        visible_entries = {
+            entry.entry_id: entry
+            for entry in self.entries
+        }
+        if previous_entry_id in visible_entries:
+            self._select_catalogue_entry(visible_entries[previous_entry_id])
             if editor_was_visible:
                 self._show_annotation_editor()
                 self._set_annotation_editor_text(editor_draft)
         elif not pairs:
-            self.selected_key = None
+            self._clear_selection()
             self._hide_selected_controls()
             if pending:
                 self.details_var.set(pending[0])
             else:
                 self.details_var.set("No complete recording pairs found yet.")
-        elif previous_key not in self.pairs_by_key:
-            self.selected_key = None
+        else:
+            self._clear_selection()
             self._hide_selected_controls()
-            self.details_var.set("Select a recording to see its files.")
+            if self.search_var.get().strip() and not self.entries:
+                self.details_var.set("No recordings match the current search.")
+            elif self.folder_view_var.get():
+                self.details_var.set(
+                    f"Folder: {self._folder_label(self.folder_path)}. "
+                    "Select a folder or recording."
+                )
+            else:
+                self.details_var.set("Select a recording to see its files.")
 
         status = f"{len(pairs)} complete recording pair(s)"
         if pending:
@@ -1248,6 +1545,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.stable_seconds < 0:
         print("ERROR: stable time cannot be negative", file=sys.stderr)
         return 2
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
 
     runner = run_console if args.console else run_gui
     return runner(

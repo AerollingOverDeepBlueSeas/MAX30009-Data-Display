@@ -30,29 +30,48 @@ python plots.py .
 
 ## Recording manager
 
-`watch_max30009.py` manages the recordings in the folder containing the plotting
-and provides a selectable catalogue of complete CSV pairs:
+`watch_max30009.py` manages the recordings below an archive root and provides a
+selectable, scrollable catalogue of complete CSV pairs:
 
 ```text
 python watch_max30009.py
 ```
 
-The manager extracts the `YYYYMMDD_HHMMSS` (or `MMDD_HHMMSS`) identifier from
-each `.bioz.csv` filename and matches its calibrated CSV using the normalized
-`MMDD_HHMMSS` token. Existing complete pairs are scanned when the manager
-starts, so no
-`--process-existing` flag is needed. Select a row to reveal `Display Plot` and
-`Annotate`. Use `Display Plot` to launch `plots.py` with both CSV paths; use
-`Annotate` to reveal the editable annotation box and then save it. The
-catalogue is refreshed only when `Refresh Now` is clicked, so editing an
-annotation cannot be interrupted by a background scan. Newly exported pairs
-appear after the next manual refresh.
+The manager recursively searches for `.bioz.csv` files and matches each one to
+a calibrated CSV in the same folder using the normalized `MMDD_HHMMSS` token.
+The displayed name includes the relative folder path, for example:
+
+```text
+2026-09-15 Human - MAX30009 > Rod used > Protocol 1 > 114952
+```
+
+Long names wrap at 100 characters. The catalogue has a vertical scrollbar and
+mouse-wheel support, and the arrow keys plus Enter remain available for
+selection and opening. Existing complete pairs are scanned when the manager
+starts, so no `--process-existing` flag is needed. Select a row to reveal
+`Display Plot` and `Annotate`. The catalogue is refreshed only when `Refresh
+Now` is clicked, so editing an annotation cannot be interrupted by a
+background scan. Newly added session folders and files appear after the next
+manual refresh.
+
+The GUI also has a `Search name/annotation` field. It performs a
+case-insensitive partial match against the displayed identifier, relative file
+paths, folder names, and annotation text. The default flat view searches the
+whole archive. Enable `Folder View` to navigate the archive structure: folders
+are shown as entries, clicking a folder or selecting it with the arrow keys and
+pressing Enter opens it, and `.. (parent folder)` moves back up. In Folder View
+only the recording identifier is shown for files because the current folder
+already supplies the path context. Search continues to apply within the
+current folder and its descendants.
 
 The annotation editor includes `Copy` and `Paste` buttons, standard keyboard
 shortcuts such as Ctrl+C/Ctrl+V, and a right-click menu.
 
 Annotations are stored in `max30009_recording_annotations.json` beside the
-script. This is a small sidecar file, not a measurement input, and it keeps
+script. Version 2 of this sidecar uses archive-relative file paths in its keys,
+so equal timestamps in different session folders remain separate. Older
+annotation files are still accepted and are migrated when an annotation is
+saved. This is a small sidecar file, not a measurement input, and it keeps
 annotations available across sessions. If Tkinter is unavailable, use (or the
 program will fall back to) a text menu:
 
@@ -66,9 +85,12 @@ annotation after proceeding replaces the malformed file with a valid one.
 
 If a manual refresh might occur while an export is still being written,
 `--stable-seconds 3` enables a safety delay; click `Refresh Now` again after
-that delay to list the pair. Other useful options are `--directory` when the
-exported files are stored somewhere other than the script directory, and
-`--annotations path/to/annotations.json` for a different sidecar location.
+that delay to list the pair. Other useful options are `--directory` to select
+a different archive root, `--annotations path/to/annotations.json` for a
+different sidecar location, and `--output-dir path/to/output` to override the
+default per-session output location. Without `--output-dir`, calculated CSVs,
+stable-period CSVs, and decoded-settings JSON files are written beside the
+selected recording's source CSVs.
 
 The default initial smooth-period threshold is ±100 Ω. The interactive window
 contains a working `Smooth ±Ω` slider that moves in 10 Ω steps; changing it
