@@ -56,7 +56,7 @@ import numpy as np
 from matplotlib import image as mpl_image
 from matplotlib.transforms import Bbox
 from matplotlib.ticker import MultipleLocator
-from matplotlib.widgets import Button, CheckButtons, Slider, TextBox
+from matplotlib.widgets import Button, CheckButtons, RadioButtons, Slider, TextBox
 
 
 DATASHEET_URL = (
@@ -833,6 +833,19 @@ class StablePeriod:
     sample_count: int
 
 
+@dataclass
+class ReferenceLine:
+    """A temporary, user-defined line shown on the interactive plots."""
+
+    line_id: int
+    orientation: str
+    value: float
+    target: Optional[str] = None
+    title: str = ""
+    notes: str = ""
+    artists: list[Any] = field(default_factory=list)
+
+
 def detect_stable_periods(
     time_s: np.ndarray,
     magnitude_ohm: np.ndarray,
@@ -1121,12 +1134,17 @@ def _plot_crop_bbox(fig: Any, axes: Iterable[Any]) -> Bbox:
 
     combined = Bbox.union(boxes)
     figure_box = fig.bbox
+    right_edge = (
+        float(combined.x1)
+        if getattr(fig, "_max30009_sidebar_visible", False)
+        else float(figure_box.x1)
+    )
     return Bbox.from_extents(
         float(figure_box.x0),
         # Do not pad below the phase x-axis label: the stable-period status
         # text lives immediately underneath the plot axes.
         max(float(figure_box.y0), float(combined.y0)),
-        float(figure_box.x1),
+        right_edge,
         float(figure_box.y1),
     )
 
@@ -1455,7 +1473,13 @@ def create_interactive_figure(
         valfmt="%0.0f",
     )
     threshold_slider.valtext.set_visible(False)
-    threshold_value_label = fig.text(0.765, 0.272, "Value (Ω)", fontsize=8, va="center")
+    threshold_value_label = fig.text(
+        0.765,
+        0.272,
+        "Value (Ω)",
+        fontsize=8,
+        va="center",
+    )
     threshold_value_axis = fig.add_axes([0.825, 0.245, 0.08, 0.045])
     threshold_value_text = TextBox(
         threshold_value_axis,
@@ -1693,12 +1717,7 @@ def create_interactive_figure(
     lower_limit_label.set_visible(initial_lower_active)
     lower_limit_axis.set_visible(initial_lower_active)
 
-    limit_update_guard = False
-
     def apply_magnitude_limits(_text: str | None = None) -> None:
-        nonlocal limit_update_guard
-        if limit_update_guard:
-            return
         upper_active, lower_active = limit_check.get_status()
         lower_value = global_mag_lower
         upper_value = global_mag_upper
@@ -1766,6 +1785,514 @@ def create_interactive_figure(
 
     fig.canvas.mpl_connect("button_press_event", on_click)
 
+    # The controls below the plots have two modes.  The original mode exposes
+    # the existing threshold, smoothing, time-window, and magnitude-limit
+    # controls.  Selecting a reference-line tab replaces them with the fields
+    # that apply to that line only.
+    reference_lines: list[ReferenceLine] = []
+    next_line_id = 1
+    selected_line_id: Optional[int] = None
+    line_form_guard = False
+    original_control_artists = (
+        threshold_axis,
+        threshold_value_label,
+        threshold_value_axis,
+        smoothing_axis,
+        custom_time_axis,
+        time_status,
+        limit_axis,
+    )
+    original_dynamic_artists = (
+        window_label,
+        window_text_axis,
+        scroll_label,
+        scroll_axis,
+        upper_limit_label,
+        upper_limit_axis,
+        lower_limit_label,
+        lower_limit_axis,
+    )
+
+    line_options_label = fig.text(
+        0.47,
+        0.158,
+        "Selected line",
+        fontsize=8,
+        va="center",
+        visible=False,
+    )
+    selected_line_value_axis = fig.add_axes([0.47, 0.11, 0.11, 0.04])
+    selected_line_value_text = TextBox(
+        selected_line_value_axis,
+        "X",
+        initial="",
+    )
+    selected_line_value_text.text_disp.set_fontsize(8)
+    selected_line_target_label = fig.text(
+        0.61,
+        0.142,
+        "Plot",
+        fontsize=7.5,
+        va="center",
+        visible=False,
+    )
+    selected_line_target_axis = fig.add_axes([0.61, 0.065, 0.14, 0.07])
+    selected_line_target_radio = RadioButtons(
+        selected_line_target_axis,
+        ["Magnitude", "Phase"],
+        active=0,
+    )
+    for label in selected_line_target_radio.labels:
+        label.set_fontsize(7.5)
+    line_title_axis = fig.add_axes([0.47, 0.06, 0.12, 0.04])
+    line_title_text = TextBox(line_title_axis, "Title", initial="")
+    line_title_text.text_disp.set_fontsize(8)
+    line_notes_axis = fig.add_axes([0.47, 0.015, 0.22, 0.04])
+    line_notes_text = TextBox(line_notes_axis, "Notes", initial="")
+    line_notes_text.text_disp.set_fontsize(8)
+    line_delete_axis = fig.add_axes([0.80, 0.045, 0.17, 0.035])
+    delete_line_button = Button(line_delete_axis, "Delete Line")
+    delete_line_button.label.set_fontsize(8)
+    line_options_axes = (
+        selected_line_value_axis,
+        selected_line_target_axis,
+        line_title_axis,
+        line_notes_axis,
+        line_delete_axis,
+    )
+
+    new_line_label = fig.text(
+        0.47,
+        0.158,
+        "New reference line",
+        fontsize=8,
+        va="center",
+        visible=False,
+    )
+    new_line_x_axis = fig.add_axes([0.47, 0.105, 0.10, 0.04])
+    new_line_x_text = TextBox(new_line_x_axis, "X", initial="")
+    new_line_x_text.text_disp.set_fontsize(8)
+    new_line_y_axis = fig.add_axes([0.59, 0.105, 0.10, 0.04])
+    new_line_y_text = TextBox(new_line_y_axis, "Y", initial="")
+    new_line_y_text.text_disp.set_fontsize(8)
+    new_line_target_label = fig.text(
+        0.47,
+        0.087,
+        "Horizontal plot",
+        fontsize=7.5,
+        va="center",
+        visible=False,
+    )
+    new_line_target_axis = fig.add_axes([0.47, 0.035, 0.20, 0.05])
+    new_line_target_radio = RadioButtons(
+        new_line_target_axis,
+        ["Magnitude", "Phase"],
+        active=0,
+    )
+    for label in new_line_target_radio.labels:
+        label.set_fontsize(7.5)
+    new_line_apply_axis = fig.add_axes([0.72, 0.105, 0.06, 0.035])
+    new_line_apply_button = Button(new_line_apply_axis, "Apply")
+    new_line_apply_button.label.set_fontsize(8)
+    new_line_cancel_axis = fig.add_axes([0.72, 0.055, 0.06, 0.035])
+    new_line_cancel_button = Button(new_line_cancel_axis, "Cancel")
+    new_line_cancel_button.label.set_fontsize(8)
+    new_line_panel_axes = (
+        new_line_x_axis,
+        new_line_y_axis,
+        new_line_target_axis,
+        new_line_apply_axis,
+        new_line_cancel_axis,
+    )
+    new_line_panel_text = (
+        new_line_label,
+        new_line_target_label,
+    )
+
+    sidebar_axis = fig.add_axes([0.77, 0.36, 0.21, 0.55])
+    sidebar_axis.set_facecolor("#f3f5f7")
+    sidebar_axis.set_xticks([])
+    sidebar_axis.set_yticks([])
+    sidebar_axis.set_title("Lines", fontsize=9, loc="left", pad=8)
+    sidebar_axis.set_visible(False)
+    fig._max30009_sidebar_visible = False
+    full_plot_positions = tuple(axis.get_position().frozen() for axis in (ax_mag, ax_phase))
+    sidebar_plot_right = 0.74
+    sidebar_tab_buttons: dict[Optional[int], Any] = {}
+
+    def set_plot_sidebar_visible(visible: bool) -> None:
+        for axis, full_position in zip((ax_mag, ax_phase), full_plot_positions):
+            if visible:
+                axis.set_position(
+                    [
+                        full_position.x0,
+                        full_position.y0,
+                        sidebar_plot_right - full_position.x0,
+                        full_position.height,
+                    ]
+                )
+            else:
+                axis.set_position(full_position)
+        sidebar_axis.set_visible(visible)
+        fig._max30009_sidebar_visible = visible
+
+    def update_original_control_visibility(visible: bool) -> None:
+        for artist in original_control_artists:
+            artist.set_visible(visible)
+        custom_time_active = visible and custom_time_check.get_status()[0]
+        upper_active, lower_active = limit_check.get_status()
+        for artist in (window_label, window_text_axis, scroll_label, scroll_axis):
+            artist.set_visible(custom_time_active)
+        upper_limit_label.set_visible(visible and upper_active)
+        upper_limit_axis.set_visible(visible and upper_active)
+        lower_limit_label.set_visible(visible and lower_active)
+        lower_limit_axis.set_visible(visible and lower_active)
+
+    def set_line_options_visible(line: Optional[ReferenceLine]) -> None:
+        nonlocal line_form_guard
+        visible = line is not None
+        line_options_label.set_visible(visible)
+        for axis in line_options_axes:
+            if axis is selected_line_target_axis:
+                continue
+            axis.set_visible(visible)
+        selected_line_target_axis.set_visible(
+            visible and line is not None and line.orientation == "horizontal"
+        )
+        selected_line_target_label.set_visible(
+            visible and line is not None and line.orientation == "horizontal"
+        )
+        if line is None:
+            return
+        line_form_guard = True
+        try:
+            selected_line_value_text.label.set_text(
+                "X" if line.orientation == "vertical" else "Y"
+            )
+            selected_line_value_text.set_val(f"{line.value:g}")
+            selected_line_target_radio.set_active(
+                0 if line.target == "magnitude" else 1
+            )
+            line_title_text.set_val(line.title)
+            line_notes_text.set_val(line.notes)
+        finally:
+            line_form_guard = False
+
+    def set_new_line_panel_visible(visible: bool) -> None:
+        for text in new_line_panel_text:
+            text.set_visible(visible)
+        for axis in new_line_panel_axes:
+            axis.set_visible(visible)
+        target_visible = visible and bool(new_line_y_text.text.strip())
+        new_line_target_label.set_visible(target_visible)
+        new_line_target_axis.set_visible(target_visible)
+
+    def line_tab_label(line: ReferenceLine) -> str:
+        if line.title.strip():
+            return f"Line {line.line_id}: {line.title.strip()}"
+        if line.orientation == "vertical":
+            return f"Line {line.line_id}: X={line.value:g}s"
+        return f"Line {line.line_id}: {line.target.title()} Y={line.value:g}"
+
+    def update_sidebar_tab_labels() -> None:
+        for line in reference_lines:
+            button = sidebar_tab_buttons.get(line.line_id)
+            if button is not None:
+                button.label.set_text(line_tab_label(line))
+
+    def refresh_legends() -> None:
+        ax_mag.legend(loc="upper right")
+        phase_has_custom_title = any(
+            line.orientation == "horizontal"
+            and line.target == "phase"
+            and line.title.strip()
+            for line in reference_lines
+        )
+        if phase_has_custom_title:
+            ax_phase.legend(loc="upper right")
+        elif ax_phase.legend_ is not None:
+            ax_phase.legend_.remove()
+
+    def create_reference_line(
+        orientation: str,
+        value: float,
+        target: Optional[str] = None,
+    ) -> ReferenceLine:
+        nonlocal next_line_id
+        green = "#2ca25f"
+        if orientation == "vertical":
+            artists = [
+                ax_mag.axvline(
+                    value,
+                    color=green,
+                    linewidth=1.5,
+                    linestyle="--",
+                    label="_nolegend_",
+                ),
+                ax_phase.axvline(
+                    value,
+                    color=green,
+                    linewidth=1.5,
+                    linestyle="--",
+                    label="_nolegend_",
+                ),
+            ]
+        else:
+            target_axis = ax_mag if target == "magnitude" else ax_phase
+            artists = [
+                target_axis.axhline(
+                    value,
+                    color=green,
+                    linewidth=1.5,
+                    label="_nolegend_",
+                )
+            ]
+        line = ReferenceLine(
+            line_id=next_line_id,
+            orientation=orientation,
+            value=value,
+            target=target,
+            artists=artists,
+        )
+        next_line_id += 1
+        reference_lines.append(line)
+        return line
+
+    def set_line_artist_labels(line: ReferenceLine) -> None:
+        label = line.title.strip() or "_nolegend_"
+        line.artists[0].set_label(label)
+        for artist in line.artists[1:]:
+            artist.set_label("_nolegend_")
+
+    def rebuild_sidebar() -> None:
+        for button in sidebar_tab_buttons.values():
+            button.ax.remove()
+        sidebar_tab_buttons.clear()
+        if not reference_lines:
+            set_plot_sidebar_visible(False)
+            return
+
+        set_plot_sidebar_visible(True)
+        tab_items: list[tuple[Optional[int], str]] = [(None, "Original plot")]
+        tab_items.extend((line.line_id, line_tab_label(line)) for line in reference_lines)
+        for index, (line_id, label) in enumerate(tab_items):
+            tab_axis = fig.add_axes([0.785, 0.845 - index * 0.045, 0.18, 0.035])
+            button = Button(tab_axis, label)
+            button.label.set_fontsize(7)
+            button.on_clicked(
+                lambda _event, selected_id=line_id: select_reference_line(selected_id)
+            )
+            sidebar_tab_buttons[line_id] = button
+        update_sidebar_tab_labels()
+
+    def select_reference_line(line_id: Optional[int]) -> None:
+        nonlocal selected_line_id
+        set_new_line_panel_visible(False)
+        selected_line_id = line_id
+        selected_line = next(
+            (line for line in reference_lines if line.line_id == line_id),
+            None,
+        )
+        if selected_line is None:
+            update_original_control_visibility(True)
+            set_line_options_visible(None)
+        else:
+            update_original_control_visibility(False)
+            set_line_options_visible(selected_line)
+        for tab_id, button in sidebar_tab_buttons.items():
+            button.ax.set_facecolor(
+                "#cfe8ff" if tab_id == selected_line_id else "#f0f0f0"
+            )
+        fig.canvas.draw_idle()
+
+    def update_selected_line_title(_text: str = "") -> None:
+        if line_form_guard or selected_line_id is None:
+            return
+        selected_line = next(
+            (line for line in reference_lines if line.line_id == selected_line_id),
+            None,
+        )
+        if selected_line is None:
+            return
+        selected_line.title = line_title_text.text
+        set_line_artist_labels(selected_line)
+        update_sidebar_tab_labels()
+        refresh_legends()
+        fig.canvas.draw_idle()
+
+    def update_selected_line_value(_text: str = "") -> None:
+        if line_form_guard or selected_line_id is None:
+            return
+        selected_line = next(
+            (line for line in reference_lines if line.line_id == selected_line_id),
+            None,
+        )
+        if selected_line is None:
+            return
+        try:
+            value = float(selected_line_value_text.text)
+        except (TypeError, ValueError):
+            selected_line_value_axis.set_facecolor("#ffe5e5")
+            return
+        if not np.isfinite(value):
+            selected_line_value_axis.set_facecolor("#ffe5e5")
+            return
+        selected_line_value_axis.set_facecolor("#f0f0f0")
+        selected_line.value = value
+        if selected_line.orientation == "vertical":
+            for artist in selected_line.artists:
+                artist.set_xdata([value, value])
+        else:
+            for artist in selected_line.artists:
+                artist.set_ydata([value, value])
+        update_sidebar_tab_labels()
+        fig.canvas.draw_idle()
+
+    def update_selected_line_target(label: str) -> None:
+        if line_form_guard or selected_line_id is None:
+            return
+        selected_line = next(
+            (line for line in reference_lines if line.line_id == selected_line_id),
+            None,
+        )
+        if selected_line is None or selected_line.orientation != "horizontal":
+            return
+        target = "magnitude" if label == "Magnitude" else "phase"
+        if selected_line.target == target:
+            return
+        for artist in selected_line.artists:
+            try:
+                artist.remove()
+            except ValueError:
+                pass
+        target_axis = ax_mag if target == "magnitude" else ax_phase
+        selected_line.artists = [
+            target_axis.axhline(
+                selected_line.value,
+                color="#2ca25f",
+                linewidth=1.5,
+                label="_nolegend_",
+            )
+        ]
+        selected_line.target = target
+        set_line_artist_labels(selected_line)
+        update_sidebar_tab_labels()
+        refresh_legends()
+        fig.canvas.draw_idle()
+
+    def update_selected_line_notes(_text: str = "") -> None:
+        if line_form_guard or selected_line_id is None:
+            return
+        selected_line = next(
+            (line for line in reference_lines if line.line_id == selected_line_id),
+            None,
+        )
+        if selected_line is not None:
+            selected_line.notes = line_notes_text.text
+
+    def delete_selected_line(_event: Any = None) -> None:
+        nonlocal selected_line_id
+        if selected_line_id is None:
+            return
+        selected_line = next(
+            (line for line in reference_lines if line.line_id == selected_line_id),
+            None,
+        )
+        if selected_line is None:
+            return
+        for artist in selected_line.artists:
+            try:
+                artist.remove()
+            except ValueError:
+                pass
+        reference_lines.remove(selected_line)
+        selected_line_id = None
+        set_new_line_panel_visible(False)
+        rebuild_sidebar()
+        select_reference_line(None)
+        refresh_legends()
+        click_text.set_text(f"Deleted line {selected_line.line_id}.")
+        fig.canvas.draw_idle()
+
+    def update_new_line_target_visibility(_text: str = "") -> None:
+        target_visible = bool(new_line_y_text.text.strip())
+        new_line_target_label.set_visible(target_visible and new_line_label.get_visible())
+        new_line_target_axis.set_visible(target_visible and new_line_label.get_visible())
+        fig.canvas.draw_idle()
+
+    def start_new_line(_event: Any = None) -> None:
+        new_line_x_text.set_val("")
+        new_line_y_text.set_val("")
+        new_line_target_radio.set_active(0)
+        set_line_options_visible(None)
+        set_new_line_panel_visible(True)
+        fig.canvas.draw_idle()
+
+    def cancel_new_line(_event: Any = None) -> None:
+        set_new_line_panel_visible(False)
+        selected_line = next(
+            (line for line in reference_lines if line.line_id == selected_line_id),
+            None,
+        )
+        if selected_line is None:
+            select_reference_line(None)
+        else:
+            select_reference_line(selected_line.line_id)
+
+    def apply_new_line(_event: Any = None) -> None:
+        x_text = new_line_x_text.text.strip()
+        y_text = new_line_y_text.text.strip()
+        if bool(x_text) and bool(y_text):
+            new_line_x_axis.set_facecolor("#ffe5e5")
+            new_line_y_axis.set_facecolor("#ffe5e5")
+            click_text.set_text("Enter either X or Y, not both.")
+            return
+        if not x_text and not y_text:
+            click_text.set_text("Enter a value in X or Y to create a line.")
+            return
+        try:
+            value = float(y_text if y_text else x_text)
+        except (TypeError, ValueError):
+            (new_line_y_axis if y_text else new_line_x_axis).set_facecolor("#ffe5e5")
+            return
+        if not np.isfinite(value):
+            (new_line_y_axis if y_text else new_line_x_axis).set_facecolor("#ffe5e5")
+            return
+
+        new_line_x_axis.set_facecolor("#f0f0f0")
+        new_line_y_axis.set_facecolor("#f0f0f0")
+        if y_text:
+            target = (
+                "magnitude"
+                if new_line_target_radio.value_selected == "Magnitude"
+                else "phase"
+            )
+            line = create_reference_line("horizontal", value, target)
+            description = f"Added green horizontal line at Y={value:g} ({target})."
+        else:
+            line = create_reference_line("vertical", value)
+            description = f"Added green dashed vertical line at X={value:g}s."
+        set_new_line_panel_visible(False)
+        rebuild_sidebar()
+        select_reference_line(line.line_id)
+        refresh_legends()
+        click_text.set_text(description)
+        fig.canvas.draw_idle()
+
+    new_line_y_text.on_text_change(update_new_line_target_visibility)
+    selected_line_value_text.on_text_change(update_selected_line_value)
+    selected_line_target_radio.on_clicked(update_selected_line_target)
+    line_title_text.on_text_change(update_selected_line_title)
+    line_notes_text.on_text_change(update_selected_line_notes)
+    delete_line_button.on_clicked(delete_selected_line)
+    new_line_apply_button.on_clicked(apply_new_line)
+    new_line_cancel_button.on_clicked(cancel_new_line)
+
+    add_line_axis = fig.add_axes([0.72, 0.005, 0.07, 0.035])
+    add_line_button = Button(add_line_axis, "Add line")
+    add_line_button.label.set_fontsize(8)
+    add_line_button.on_clicked(start_new_line)
+
     copy_axis = fig.add_axes([0.80, 0.005, 0.17, 0.035])
     copy_button = Button(copy_axis, "Copy to Clipboard")
     copy_button.label.set_fontsize(8)
@@ -1777,14 +2304,23 @@ def create_interactive_figure(
         except ClipboardError as exc:
             click_text.set_text(f"Could not copy plot: {exc}")
         else:
-            click_text.set_text("Plot copied to clipboard (plot and labels only).")
+            click_text.set_text(
+                "Plot copied to clipboard (plots, reference lines, and legends)."
+            )
         fig.canvas.draw_idle()
 
     copy_button.on_clicked(copy_plot)
+    line_options_label.set_visible(False)
+    for axis in line_options_axes:
+        axis.set_visible(False)
+    set_new_line_panel_visible(False)
+    update_original_control_visibility(True)
+    rebuild_sidebar()
+    refresh_legends()
 
     # Matplotlib widget callbacks do not necessarily keep widget instances
-    # alive.  Retaining them on the figure fixes the previously unresponsive
-    # threshold slider and also keeps the new controls interactive.
+    # alive. Retaining every widget on the figure keeps all tabs and fields
+    # interactive after the window has opened.
     fig._max30009_widgets = {
         "threshold_slider": threshold_slider,
         "threshold_value_text": threshold_value_text,
@@ -1795,6 +2331,19 @@ def create_interactive_figure(
         "limit_check": limit_check,
         "upper_limit_text": upper_limit_text,
         "lower_limit_text": lower_limit_text,
+        "add_line_button": add_line_button,
+        "new_line_x_text": new_line_x_text,
+        "new_line_y_text": new_line_y_text,
+        "new_line_target_radio": new_line_target_radio,
+        "new_line_apply_button": new_line_apply_button,
+        "new_line_cancel_button": new_line_cancel_button,
+        "selected_line_value_text": selected_line_value_text,
+        "selected_line_target_radio": selected_line_target_radio,
+        "line_title_text": line_title_text,
+        "line_notes_text": line_notes_text,
+        "delete_line_button": delete_line_button,
+        "line_tabs": sidebar_tab_buttons,
+        "reference_lines": reference_lines,
         "copy_button": copy_button,
     }
     return fig, periods

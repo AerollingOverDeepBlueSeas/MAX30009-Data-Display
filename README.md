@@ -30,11 +30,11 @@ python plots.py .
 
 ## Recording manager
 
-`watch_max30009.py` manages the recordings below an archive root and provides a
+`watch.py` manages the recordings below an archive root and provides a
 selectable, scrollable catalogue of complete CSV pairs:
 
 ```text
-python watch_max30009.py
+python watch.py
 ```
 
 The manager recursively searches for `.bioz.csv` files and matches each one to
@@ -76,7 +76,7 @@ annotations available across sessions. If Tkinter is unavailable, use (or the
 program will fall back to) a text menu:
 
 ```text
-python watch_max30009.py --console
+python watch.py --console
 ```
 
 If the annotation file is malformed, the GUI shows a warning and asks whether
