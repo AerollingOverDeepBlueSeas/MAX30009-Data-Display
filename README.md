@@ -49,10 +49,26 @@ Long names wrap at 100 characters. The catalogue has a vertical scrollbar and
 mouse-wheel support, and the arrow keys plus Enter remain available for
 selection and opening. Existing complete pairs are scanned when the manager
 starts, so no `--process-existing` flag is needed. Select a row to reveal
-`Display Plot` and `Annotate`. The catalogue is refreshed only when `Refresh
-Now` is clicked, so editing an annotation cannot be interrupted by a
+`Display Plot` and `Annotate`. The catalogue is refreshed only when `Refresh`
+is clicked, so editing an annotation cannot be interrupted by a
 background scan. Newly added session folders and files appear after the next
 manual refresh.
+
+Each file entry is outlined as a block so its annotation remains visually
+attached to the corresponding recording. With a file selected, `Enter` opens
+its plot and `a` opens the annotation editor. With a folder selected, `Enter`
+opens that folder and `a` opens its folder annotation editor.
+
+In Folder View, folders are selected first and opened with `Enter`; their
+annotations are shown below the action buttons rather than beneath the folder
+name. Folder annotations are stored in the same validated JSON sidecar as file
+annotations. In the flat view, a file row includes any annotated ancestor
+folders from shallowest to deepest, followed by the file annotation, each on a
+separate line.
+
+Hold Ctrl while clicking file rows to select more than one recording. Pressing
+`Enter` then opens all selected plots. Mass annotation is intentionally not
+available: `Annotate` and `a` require exactly one selected file or folder.
 
 The GUI also has a `Search name/annotation` field. It performs a
 case-insensitive partial match against the displayed identifier, relative file
@@ -69,7 +85,8 @@ shortcuts such as Ctrl+C/Ctrl+V, and a right-click menu.
 
 Annotations are stored in `max30009_recording_annotations.json` beside the
 script. Version 2 of this sidecar uses archive-relative file paths in its keys,
-so equal timestamps in different session folders remain separate. Older
+including a folder-key prefix for folder annotations, so equal timestamps in
+different session folders remain separate. Older
 annotation files are still accepted and are migrated when an annotation is
 saved. This is a small sidecar file, not a measurement input, and it keeps
 annotations available across sessions. If Tkinter is unavailable, use (or the
@@ -84,13 +101,19 @@ to exit and repair it or proceed without the old annotations. Saving an
 annotation after proceeding replaces the malformed file with a valid one.
 
 If a manual refresh might occur while an export is still being written,
-`--stable-seconds 3` enables a safety delay; click `Refresh Now` again after
+`--stable-seconds 3` enables a safety delay; click `Refresh` again after
 that delay to list the pair. Other useful options are `--directory` to select
 a different archive root, `--annotations path/to/annotations.json` for a
 different sidecar location, and `--output-dir path/to/output` to override the
 default per-session output location. Without `--output-dir`, calculated CSVs,
 stable-period CSVs, and decoded-settings JSON files are written beside the
 selected recording's source CSVs.
+
+The complete/incomplete count at the bottom of the manager is clickable. It
+opens a console-like panel containing the archive-relative filename and the
+reason each candidate is not ready, such as a missing companion CSV, an
+ambiguous companion match, files that are still changing, or an unsupported
+BioZ filename. Click the count again to hide the panel.
 
 The default initial smooth-period threshold is ±100 Ω. The interactive window
 contains a working `Smooth ±Ω` slider that moves in 10 Ω steps; changing it
@@ -118,7 +141,26 @@ The phase graph uses a fixed −180° to 180° vertical range, with ticks at
 The shared time axis uses 4-second major grid spacing. Clicking either plot
 displays the nearest sample's time, magnitude, phase, and calibrated I/Q
 values. If that sample lies within a detected stable period, the readout also
-includes the period's average impedance.
+includes the period's average and median impedance.
+
+`Add Line` opens X and Y fields in the lower-right controls. Enter X to add a
+green dashed vertical line at that time on both plots. Enter Y to add a green
+horizontal line; only then does the Magnitude/Phase choice appear, allowing
+the user to choose its plot. Only one of X or Y may be used for each line.
+While a new line is being entered, the original controls and any existing-line
+controls are hidden and inactive so they cannot receive mouse or keyboard
+input. `Cancel` restores the tab and controls that were active beforehand;
+`Apply` opens the newly created line's options.
+
+After the first line is created, a right-hand Lines panel appears with an
+`Original plot` tab and one tab per temporary line. The original tab restores
+all existing controls. A line tab exposes only its X or Y/plot controls and
+also provides optional `Title` and `Notes` fields. A title is added to the
+appropriate plot legend; `Delete Line` removes the line, its title, and its
+tab. Line numbers remain contiguous after deletion, and a new line uses the
+next available number. `Add Line`, `Delete Line`, and `Copy to Clipboard` are
+arranged as a consistent vertical button stack. These line settings are
+temporary and are not persisted.
 
 The `Smoothing (s)` slider is a temporary, display-only control. It ranges from
 0 to 0.5 seconds in 0.1-second steps; 0 means no smoothing. A selected window
@@ -127,10 +169,11 @@ they are converted back to displayed magnitude and phase. The source data,
 click readouts, stability detection, and exported CSV files are not changed,
 and the smoothing selection is discarded when the program closes.
 
-`Copy to Clipboard` copies a full-width PNG screenshot from the top of the
-figure through the phase time-axis label, while leaving the controls below the
-plots out of the image. The capture uses the actual rendered pixel buffer, so
-it also works correctly on high-DPI Windows displays. On Windows this uses the
+`Copy to Clipboard` copies a PNG screenshot from the top of the figure through
+the phase time-axis label, including temporary reference lines and any legend
+titles, while leaving the controls and Lines panel out of the image. The
+capture uses the actual rendered pixel buffer, so it also works correctly on
+high-DPI Windows displays. On Windows this uses the
 built-in image clipboard format. On Linux, an image clipboard helper such as
 `wl-copy` or `xclip` is required; if no supported clipboard backend is
 available, the program reports that in the readout area.

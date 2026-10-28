@@ -1764,6 +1764,8 @@ def create_interactive_figure(
         return before if abs(data.time_s[before] - x_value) <= abs(data.time_s[index] - x_value) else index
 
     def on_click(event: Any) -> None:
+        if line_creation_active:
+            return
         if event.inaxes not in (ax_mag, ax_phase) or event.xdata is None:
             return
         index = nearest_sample(float(event.xdata))
@@ -1779,7 +1781,10 @@ def create_interactive_figure(
         )
         stable_period = stable_period_containing(periods, x_value)
         if stable_period is not None:
-            message += f"   |   Average Impedance={stable_period.mean_ohm:.6f}Ω"
+            message += (
+                f"   |   Average Impedance={stable_period.mean_ohm:.6f}Ω"
+                f"   |   Median Impedance={stable_period.median_ohm:.6f}Ω"
+            )
         click_text.set_text(message)
         fig.canvas.draw_idle()
 
@@ -1790,8 +1795,9 @@ def create_interactive_figure(
     # controls.  Selecting a reference-line tab replaces them with the fields
     # that apply to that line only.
     reference_lines: list[ReferenceLine] = []
-    next_line_id = 1
     selected_line_id: Optional[int] = None
+    line_creation_active = False
+    line_creation_previous_line_id: Optional[int] = None
     line_form_guard = False
     original_control_artists = (
         threshold_axis,
@@ -1850,7 +1856,7 @@ def create_interactive_figure(
     line_notes_axis = fig.add_axes([0.47, 0.015, 0.22, 0.04])
     line_notes_text = TextBox(line_notes_axis, "Notes", initial="")
     line_notes_text.text_disp.set_fontsize(8)
-    line_delete_axis = fig.add_axes([0.80, 0.045, 0.17, 0.035])
+    line_delete_axis = fig.add_axes([0.80, 0.075, 0.17, 0.035])
     delete_line_button = Button(line_delete_axis, "Delete Line")
     delete_line_button.label.set_fontsize(8)
     line_options_axes = (
@@ -1909,6 +1915,53 @@ def create_interactive_figure(
         new_line_target_label,
     )
 
+    def set_radio_widget_visible(radio: Any, visible: bool) -> None:
+        """Hide both a RadioButtons axes and its independently drawn artists."""
+
+        radio.ax.set_visible(visible)
+        radio._active = bool(visible)
+        buttons = getattr(radio, "_buttons", None)
+        if buttons is not None:
+            buttons.set_visible(visible)
+        for label in getattr(radio, "labels", ()):
+            label.set_visible(visible)
+
+    all_text_boxes = (
+        threshold_value_text,
+        window_text,
+        upper_limit_text,
+        lower_limit_text,
+        selected_line_value_text,
+        line_title_text,
+        line_notes_text,
+        new_line_x_text,
+        new_line_y_text,
+    )
+
+    def release_mouse_capture() -> None:
+        """Release stale TextBox keyboard/mouse capture before a mode switch."""
+
+        for text_box in all_text_boxes:
+            if getattr(text_box, "capturekeystrokes", False):
+                text_box.stop_typing()
+        mouse_grabber = getattr(fig.canvas, "mouse_grabber", None)
+        if mouse_grabber is not None:
+            fig.canvas.release_mouse(mouse_grabber)
+
+    def set_widget_active(widget: Any, active: bool) -> None:
+        """Toggle event handling without invoking selector callbacks."""
+
+        if not active and getattr(widget, "capturekeystrokes", False):
+            widget.stop_typing()
+        # CheckButtons and RadioButtons override set_active() to select a
+        # button, so changing _active directly is intentional here: it is the
+        # Widget-level event gate used by ignore().
+        widget._active = bool(active)
+
+    def set_widget_visibility(widget: Any, axis: Any, visible: bool) -> None:
+        axis.set_visible(visible)
+        set_widget_active(widget, visible)
+
     sidebar_axis = fig.add_axes([0.77, 0.36, 0.21, 0.55])
     sidebar_axis.set_facecolor("#f3f5f7")
     sidebar_axis.set_xticks([])
@@ -1937,30 +1990,56 @@ def create_interactive_figure(
         fig._max30009_sidebar_visible = visible
 
     def update_original_control_visibility(visible: bool) -> None:
+        release_mouse_capture()
         for artist in original_control_artists:
             artist.set_visible(visible)
+        for widget, axis in (
+            (threshold_slider, threshold_axis),
+            (threshold_value_text, threshold_value_axis),
+            (smoothing_slider, smoothing_axis),
+            (custom_time_check, custom_time_axis),
+            (limit_check, limit_axis),
+        ):
+            set_widget_visibility(widget, axis, visible)
         custom_time_active = visible and custom_time_check.get_status()[0]
         upper_active, lower_active = limit_check.get_status()
-        for artist in (window_label, window_text_axis, scroll_label, scroll_axis):
-            artist.set_visible(custom_time_active)
+        window_label.set_visible(custom_time_active)
+        scroll_label.set_visible(custom_time_active)
+        set_widget_visibility(window_text, window_text_axis, custom_time_active)
+        set_widget_visibility(scroll_slider, scroll_axis, custom_time_active)
         upper_limit_label.set_visible(visible and upper_active)
-        upper_limit_axis.set_visible(visible and upper_active)
+        set_widget_visibility(
+            upper_limit_text,
+            upper_limit_axis,
+            visible and upper_active,
+        )
         lower_limit_label.set_visible(visible and lower_active)
-        lower_limit_axis.set_visible(visible and lower_active)
+        set_widget_visibility(
+            lower_limit_text,
+            lower_limit_axis,
+            visible and lower_active,
+        )
 
     def set_line_options_visible(line: Optional[ReferenceLine]) -> None:
         nonlocal line_form_guard
+        release_mouse_capture()
         visible = line is not None
         line_options_label.set_visible(visible)
-        for axis in line_options_axes:
-            if axis is selected_line_target_axis:
-                continue
-            axis.set_visible(visible)
-        selected_line_target_axis.set_visible(
+        horizontal_visible = (
             visible and line is not None and line.orientation == "horizontal"
         )
+        set_widget_visibility(
+            selected_line_value_text,
+            selected_line_value_axis,
+            visible,
+        )
+        set_widget_visibility(selected_line_target_radio, selected_line_target_axis, horizontal_visible)
+        set_radio_widget_visible(selected_line_target_radio, horizontal_visible)
+        set_widget_visibility(line_title_text, line_title_axis, visible)
+        set_widget_visibility(line_notes_text, line_notes_axis, visible)
+        set_widget_visibility(delete_line_button, line_delete_axis, visible)
         selected_line_target_label.set_visible(
-            visible and line is not None and line.orientation == "horizontal"
+            horizontal_visible
         )
         if line is None:
             return
@@ -1979,13 +2058,16 @@ def create_interactive_figure(
             line_form_guard = False
 
     def set_new_line_panel_visible(visible: bool) -> None:
+        release_mouse_capture()
         for text in new_line_panel_text:
             text.set_visible(visible)
-        for axis in new_line_panel_axes:
-            axis.set_visible(visible)
+        set_widget_visibility(new_line_x_text, new_line_x_axis, visible)
+        set_widget_visibility(new_line_y_text, new_line_y_axis, visible)
+        set_widget_visibility(new_line_apply_button, new_line_apply_axis, visible)
+        set_widget_visibility(new_line_cancel_button, new_line_cancel_axis, visible)
         target_visible = visible and bool(new_line_y_text.text.strip())
         new_line_target_label.set_visible(target_visible)
-        new_line_target_axis.set_visible(target_visible)
+        set_radio_widget_visible(new_line_target_radio, target_visible)
 
     def line_tab_label(line: ReferenceLine) -> str:
         if line.title.strip():
@@ -2018,7 +2100,6 @@ def create_interactive_figure(
         value: float,
         target: Optional[str] = None,
     ) -> ReferenceLine:
-        nonlocal next_line_id
         green = "#2ca25f"
         if orientation == "vertical":
             artists = [
@@ -2048,15 +2129,20 @@ def create_interactive_figure(
                 )
             ]
         line = ReferenceLine(
-            line_id=next_line_id,
+            line_id=len(reference_lines) + 1,
             orientation=orientation,
             value=value,
             target=target,
             artists=artists,
         )
-        next_line_id += 1
         reference_lines.append(line)
         return line
+
+    def renumber_reference_lines() -> None:
+        """Keep temporary line labels contiguous after a deletion."""
+
+        for line_number, line in enumerate(reference_lines, start=1):
+            line.line_id = line_number
 
     def set_line_artist_labels(line: ReferenceLine) -> None:
         label = line.title.strip() or "_nolegend_"
@@ -2079,6 +2165,7 @@ def create_interactive_figure(
             tab_axis = fig.add_axes([0.785, 0.845 - index * 0.045, 0.18, 0.035])
             button = Button(tab_axis, label)
             button.label.set_fontsize(7)
+            button.set_active(not line_creation_active)
             button.on_clicked(
                 lambda _event, selected_id=line_id: select_reference_line(selected_id)
             )
@@ -2087,6 +2174,9 @@ def create_interactive_figure(
 
     def select_reference_line(line_id: Optional[int]) -> None:
         nonlocal selected_line_id
+        if line_creation_active:
+            return
+        release_mouse_capture()
         set_new_line_panel_visible(False)
         selected_line_id = line_id
         selected_line = next(
@@ -2192,6 +2282,8 @@ def create_interactive_figure(
 
     def delete_selected_line(_event: Any = None) -> None:
         nonlocal selected_line_id
+        if line_creation_active:
+            return
         if selected_line_id is None:
             return
         selected_line = next(
@@ -2206,38 +2298,38 @@ def create_interactive_figure(
             except ValueError:
                 pass
         reference_lines.remove(selected_line)
+        deleted_line_number = selected_line.line_id
+        renumber_reference_lines()
         selected_line_id = None
         set_new_line_panel_visible(False)
         rebuild_sidebar()
         select_reference_line(None)
         refresh_legends()
-        click_text.set_text(f"Deleted line {selected_line.line_id}.")
+        click_text.set_text(f"Deleted line {deleted_line_number}.")
         fig.canvas.draw_idle()
 
     def update_new_line_target_visibility(_text: str = "") -> None:
-        target_visible = bool(new_line_y_text.text.strip())
+        target_visible = line_creation_active and bool(new_line_y_text.text.strip())
         new_line_target_label.set_visible(target_visible and new_line_label.get_visible())
-        new_line_target_axis.set_visible(target_visible and new_line_label.get_visible())
+        set_radio_widget_visible(
+            new_line_target_radio,
+            target_visible and new_line_label.get_visible(),
+        )
         fig.canvas.draw_idle()
 
     def start_new_line(_event: Any = None) -> None:
+        if line_creation_active:
+            return
+        release_mouse_capture()
         new_line_x_text.set_val("")
         new_line_y_text.set_val("")
         new_line_target_radio.set_active(0)
-        set_line_options_visible(None)
-        set_new_line_panel_visible(True)
+        set_line_creation_mode(True)
         fig.canvas.draw_idle()
 
     def cancel_new_line(_event: Any = None) -> None:
-        set_new_line_panel_visible(False)
-        selected_line = next(
-            (line for line in reference_lines if line.line_id == selected_line_id),
-            None,
-        )
-        if selected_line is None:
-            select_reference_line(None)
-        else:
-            select_reference_line(selected_line.line_id)
+        set_line_creation_mode(False)
+        fig.canvas.draw_idle()
 
     def apply_new_line(_event: Any = None) -> None:
         x_text = new_line_x_text.text.strip()
@@ -2272,9 +2364,8 @@ def create_interactive_figure(
         else:
             line = create_reference_line("vertical", value)
             description = f"Added green dashed vertical line at X={value:g}s."
-        set_new_line_panel_visible(False)
         rebuild_sidebar()
-        select_reference_line(line.line_id)
+        set_line_creation_mode(False, line.line_id)
         refresh_legends()
         click_text.set_text(description)
         fig.canvas.draw_idle()
@@ -2288,16 +2379,66 @@ def create_interactive_figure(
     new_line_apply_button.on_clicked(apply_new_line)
     new_line_cancel_button.on_clicked(cancel_new_line)
 
-    add_line_axis = fig.add_axes([0.72, 0.005, 0.07, 0.035])
-    add_line_button = Button(add_line_axis, "Add line")
+    button_width = 0.17
+    button_height = 0.035
+    button_x = 0.80
+    add_line_axis = fig.add_axes([button_x, 0.145, button_width, button_height])
+    add_line_button = Button(add_line_axis, "Add Line")
     add_line_button.label.set_fontsize(8)
     add_line_button.on_clicked(start_new_line)
 
-    copy_axis = fig.add_axes([0.80, 0.005, 0.17, 0.035])
+    copy_axis = fig.add_axes([button_x, 0.005, button_width, button_height])
     copy_button = Button(copy_axis, "Copy to Clipboard")
     copy_button.label.set_fontsize(8)
 
+    def set_line_creation_mode(
+        active: bool,
+        restore_line_id: Optional[int] = None,
+    ) -> None:
+        """Enter or leave the modal new-reference-line editing state."""
+
+        nonlocal line_creation_active, line_creation_previous_line_id
+        if active:
+            if line_creation_active:
+                return
+            release_mouse_capture()
+            line_creation_previous_line_id = selected_line_id
+            line_creation_active = True
+
+            # The new-line fields share space with both the original controls
+            # and the selected-line controls.  Hide and deactivate everything
+            # else before showing them.
+            set_line_options_visible(None)
+            update_original_control_visibility(False)
+            set_widget_visibility(add_line_button, add_line_axis, False)
+            set_widget_visibility(copy_button, copy_axis, False)
+            for button in sidebar_tab_buttons.values():
+                button.set_active(False)
+            set_new_line_panel_visible(True)
+            return
+
+        if not line_creation_active:
+            return
+        release_mouse_capture()
+        previous_line_id = line_creation_previous_line_id
+        line_creation_active = False
+        line_creation_previous_line_id = None
+        set_new_line_panel_visible(False)
+        set_widget_visibility(add_line_button, add_line_axis, True)
+        set_widget_visibility(copy_button, copy_axis, True)
+        for button in sidebar_tab_buttons.values():
+            button.set_active(True)
+
+        target_line_id = (
+            previous_line_id if restore_line_id is None else restore_line_id
+        )
+        if not any(line.line_id == target_line_id for line in reference_lines):
+            target_line_id = None
+        select_reference_line(target_line_id)
+
     def copy_plot(_event: Any = None) -> None:
+        if line_creation_active:
+            return
         try:
             png_bytes, rgba = render_plot_for_clipboard(fig, (ax_mag, ax_phase))
             copy_image_to_clipboard(png_bytes, rgba)
@@ -2310,9 +2451,7 @@ def create_interactive_figure(
         fig.canvas.draw_idle()
 
     copy_button.on_clicked(copy_plot)
-    line_options_label.set_visible(False)
-    for axis in line_options_axes:
-        axis.set_visible(False)
+    set_line_options_visible(None)
     set_new_line_panel_visible(False)
     update_original_control_visibility(True)
     rebuild_sidebar()
